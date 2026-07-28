@@ -7,7 +7,7 @@ OpenClaw agent to Helm Link.
 
 Helm generates a private connection command pinned to an exact public package
 version. Never replace that version with `latest`, reuse an expired connection
-code, or paste or screenshot the command. Version `0.1.0` is eligible for
+code, or paste or screenshot the command. Version `0.1.1` is eligible for
 publication only through the repository's tag-bound GitHub OIDC workflow with
 npm provenance.
 
@@ -18,7 +18,7 @@ hosted round trip. Follow `docs/HELM_LINK_SUPERVISED_PILOT_RUNBOOK.md` for the
 actual-custody gate.
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.1.0' doctor --agent your-openclaw-agent-id
+npx --yes '@pharos-hq/helm-link-connector@0.1.1' doctor --agent your-openclaw-agent-id
 ```
 
 Connection codes are intentionally omitted from documentation. Generate the
