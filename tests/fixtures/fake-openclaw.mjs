@@ -20,4 +20,3 @@ if (command === 'agents' && subcommand === 'list') {
 
 console.error(`unsupported fake-openclaw command: ${process.argv.slice(2).join(' ')}`)
 process.exit(2)
-

@@ -58,4 +58,3 @@ jobs:
           test "$version" = '0.1.0'
           test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.1.0'
           npm view '@pharos-hq/helm-link-connector@0.1.0' dist.integrity dist.shasum dist.attestations --json
-

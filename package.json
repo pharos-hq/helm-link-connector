@@ -10,4 +10,3 @@
     "test": "node tests/release-boundary.test.mjs"
   }
 }
-

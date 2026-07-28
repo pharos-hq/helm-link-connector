@@ -17,4 +17,3 @@ Releases are published only by the tag-bound GitHub Actions workflow using npm
 trusted publishing through OIDC with provenance. Maintainers must not publish
 interactively, add an npm token, remove provenance, weaken the package allowlist,
 or move a release tag.
-

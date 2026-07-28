@@ -26,4 +26,3 @@ jobs:
         run: |
           node --check packages/helm-link-connector/bin/helm-link.mjs
           bash -n packages/helm-link-connector/supervisors/run-supervised.sh
-
