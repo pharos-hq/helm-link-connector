@@ -1,0 +1,36 @@
+; HFA-005 / HFA-015 — systemd unit template for the Helm Link connector.
+; Revocation is terminal: exit code 75 must NOT trigger a restart. That
+; is enforced with `RestartPreventExitStatus=75`. Restart=on-failure
+; keeps transient errors self-healing.
+;
+; Substitute placeholders before installing:
+;   HELM_LINK_BIN      — absolute path to helm-link (wrapper or npm bin)
+;   HELM_LINK_STATE    — writable state directory owned by helm-link
+;   HELM_LINK_USER     — dedicated non-root user
+[Unit]
+Description=Helm Link Connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=HELM_LINK_USER
+Group=HELM_LINK_USER
+Environment=HELM_LINK_STATE_DIR=HELM_LINK_STATE
+Environment=NO_COLOR=1
+ExecStart=HELM_LINK_BIN run
+Restart=on-failure
+RestartSec=5
+; HFA-005 — 75 == terminal revocation. systemd will stop restarting on
+; this exit code, so a revoked binding does not spin forever.
+RestartPreventExitStatus=75
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=HELM_LINK_STATE
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

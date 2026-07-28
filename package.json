@@ -1,0 +1,13 @@
+{
+  "name": "helm-link-connector-release-boundary",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "scripts": {
+    "test": "node tests/release-boundary.test.mjs"
+  }
+}
+

@@ -1,0 +1,61 @@
+name: Publish Helm Link connector
+
+on:
+  push:
+    tags:
+      - 'helm-link-connector-v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EXPECTED_SHA256: da7f10d733be9ec82b611e4033dc0db934f4f3d624f2bdc0024bf78b38463ff6
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.14.0
+          registry-url: https://registry.npmjs.org
+      - name: Install pinned OIDC-capable npm CLI
+        run: npm install --global npm@11.16.0
+      - name: Verify tag, package identity, and exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./packages/helm-link-connector/package.json').name")"
+          package_version="$(node -p "require('./packages/helm-link-connector/package.json').version")"
+          test "$package_name" = '@pharos-hq/helm-link-connector'
+          test "$GITHUB_REF_NAME" = "helm-link-connector-v${package_version}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          npm test
+      - name: Build and audit exact publication archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/package-helm-link-connector.mjs --out-dir /tmp/helm-link-publish
+          archive=/tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.0.tgz
+          test "$(find /tmp/helm-link-publish -maxdepth 1 -name '*.tgz' | wc -l | tr -d ' ')" = 1
+          test "$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          (cd /tmp/helm-link-publish && sha256sum --check SHA256SUMS)
+      - name: Publish public package with npm provenance
+        run: npm publish /tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.0.tgz --access public --tag latest --provenance
+      - name: Verify registry integrity, tags, and attestation receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 12); do
+            version="$(npm view '@pharos-hq/helm-link-connector@0.1.0' version 2>/dev/null || true)"
+            if [[ "$version" = '0.1.0' ]]; then break; fi
+            sleep 5
+          done
+          test "$version" = '0.1.0'
+          test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.1.0'
+          npm view '@pharos-hq/helm-link-connector@0.1.0' dist.integrity dist.shasum dist.attestations --json
+

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  HFA-005 / HFA-015 — macOS launchd template for the Helm Link
+  connector. Revocation is terminal: the connector exits with code 75
+  and this plist honors that by using KeepAlive.SuccessfulExit=false
+  rather than the blanket KeepAlive=true. A revoked binding must NOT
+  spin up a restart loop.
+
+  Placeholders:
+    NODE_BIN            — absolute path to node (default: /usr/local/bin/node)
+    HELM_LINK_BIN       — absolute path to bundled helm-link.mjs launcher
+    HELM_LINK_STATE_DIR — writable state dir owned by the connector user
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.helm.link</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>HELM_LINK_SUPERVISOR_WRAPPER</string>
+    <string>NODE_BIN</string>
+    <string>HELM_LINK_BIN</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HELM_LINK_STATE_DIR</key>
+    <string>HELM_LINK_STATE_DIR</string>
+    <key>NO_COLOR</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <!--
+      run-supervised.sh maps terminal revocation exit 75 to exit 0.
+      SuccessfulExit=false therefore restarts transient failures but
+      remains stopped after owner revocation.
+    -->
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>StandardOutPath</key><string>/var/log/helm-link.out.log</string>
+  <key>StandardErrorPath</key><string>/var/log/helm-link.err.log</string>
+  <key>ExitTimeOut</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>

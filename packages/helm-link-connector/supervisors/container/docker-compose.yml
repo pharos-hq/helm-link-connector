@@ -1,0 +1,21 @@
+# HFA-005 / HFA-015 — container supervisor template for the Helm Link
+# connector. run-supervised.sh maps terminal revocation exit 75 to
+# success while transient failures retain a bounded retry budget.
+services:
+  helm-link:
+    image: HELM_LINK_IMAGE_DIGEST
+    restart: on-failure:3
+    environment:
+      HELM_LINK_STATE_DIR: /state
+      HELM_LINK_OPENCLAW_BIN: /usr/local/bin/openclaw
+      NO_COLOR: "1"
+    volumes:
+      - helm-link-state:/state
+    command: ["/opt/helm-link/run-supervised.sh", "helm-link", "run"]
+    # HFA-005 — surface exit 75 explicitly for humans reading `docker inspect`.
+    labels:
+      helm.link.terminal-exit-code: "75"
+      helm.link.revocation: "exit 75 signals terminal revocation; the container must not be forced back up by supervisor policy."
+
+volumes:
+  helm-link-state:

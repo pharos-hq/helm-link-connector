@@ -1,0 +1,29 @@
+name: Connector release boundary
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.14.0
+      - name: Verify audited source, archive, workflow, and installed CLI
+        run: npm test
+      - name: Validate executable syntax
+        run: |
+          node --check packages/helm-link-connector/bin/helm-link.mjs
+          bash -n packages/helm-link-connector/supervisors/run-supervised.sh
+

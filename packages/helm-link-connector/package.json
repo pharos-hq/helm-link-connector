@@ -1,0 +1,28 @@
+{
+  "name": "@pharos-hq/helm-link-connector",
+  "version": "0.1.0",
+  "description": "Host-neutral outbound HTTPS Helm Link connector for bring-your-own OpenClaw agents.",
+  "type": "module",
+  "bin": {
+    "helm-link": "bin/helm-link.mjs"
+  },
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "files": [
+    "bin",
+    "supervisors",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pharos-hq/Helm-pwa.git",
+    "directory": "packages/helm-link-connector"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
