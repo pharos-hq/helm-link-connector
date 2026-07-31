@@ -7,6 +7,6 @@
     "node": ">=22 <25"
   },
   "scripts": {
-    "test": "node tests/release-boundary.test.mjs"
+    "test": "node tests/openclaw-adapter.test.mjs && node tests/release-boundary.test.mjs"
   }
 }

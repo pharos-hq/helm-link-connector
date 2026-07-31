@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.1.1'
+const VERSION = '0.1.2'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LEDGER_MAX = 200
@@ -132,14 +132,14 @@ function runtimeModelForAgent(agentId) {
   }
 }
 
-function advisoryArgs(agentId, bindingId, text) {
+export function advisoryArgs(agentId, bindingId, text) {
   if (DENIED.test(text)) throw new Error('Advisory-only Helm Link accepts chat, not tool or execution commands.')
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-message-'))
   const file = join(dir, 'message.txt')
   writePrivate(file, text)
   return {
-    args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-link:${bindingId}`, '--message-file', file, '--timeout', '120'],
+    args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-link:${bindingId}`, '--message-file', file, '--timeout', '120', '--json'],
     cleanup() {
       try { unlinkSync(file) } catch {}
       try { rmSync(dir, { recursive: true, force: true }) } catch {}
@@ -289,41 +289,21 @@ async function handleDispatch(state, dispatch) {
   const text = dispatch.payload?.text
   const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
   await postConnectorEvent(state, statusEvent(state, dispatch, 'working'))
-  const child = spawn(resolveOpenClaw(), invocation.args, { env: { ...process.env, NO_COLOR: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
-  let stdout = ''
-  let stderr = ''
-  let uploadedDeltaBytes = 0
-  const deltas = []
-  child.stdout.on('data', (chunk) => {
-    const textChunk = sanitizeChunk(chunk.toString())
-    stdout += textChunk
-    if (!textChunk || uploadedDeltaBytes >= 100000) return
-    // HFA-004 — only forward chunks that parse as structured OpenClaw
-    // response frames (`{"type":"delta", "text":"…"}` or similar).
-    // Raw stdout is diagnostic-only and must never be presented as
-    // customer content.
-    const structured = parseStructuredDelta(textChunk)
-    if (!structured) return
-    const bounded = structured.slice(0, Math.max(0, 20000 - Math.min(uploadedDeltaBytes, 20000)))
-    if (!bounded) return
-    uploadedDeltaBytes += Buffer.byteLength(bounded, 'utf8')
-    deltas.push(bounded)
-  })
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
   try {
-    const code = await new Promise((resolve) => child.on('close', resolve))
-    for (const delta of deltas) {
-      await postConnectorEvent(state, deltaEvent(state, dispatch, delta))
-    }
-    if (code !== 0) {
-      const event = finalEvent(state, dispatch, `OpenClaw advisory failed: ${sanitizeChunk(stderr).slice(0, 400)}`, true)
-      await postConnectorEvent(state, event)
-      await postJson(state, '/api/helm-link/connector/ack', { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_failed', terminalSummary: sanitizeChunk(stderr).slice(0, 400) || 'OpenClaw failed.' })
+    const result = await runOpenClawAdvisory({ args: invocation.args })
+    if (result.timedOut) {
+      const summary = 'OpenClaw advisory timed out; no customer content produced.'
+      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
+      await postJson(state, '/api/helm-link/connector/ack', { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_timeout', terminalSummary: summary })
+    } else if (result.code !== 0 || result.overflow) {
+      const summary = 'OpenClaw advisory failed; no customer content produced.'
+      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
+      await postJson(state, '/api/helm-link/connector/ack', { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_failed', terminalSummary: summary })
     } else {
       // HFA-004 — extractText requires structured output; if OpenClaw
       // produced no parseable response frame the run is treated as a
       // controlled failure rather than posting stdout to the customer.
-      const finalText = extractStructuredText(stdout)
+      const finalText = extractStructuredText(result.stdout)
       if (!finalText) {
         const summary = 'OpenClaw returned no structured response frame; no customer content produced.'
         await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
@@ -335,7 +315,11 @@ async function handleDispatch(state, dispatch) {
           terminalSummary: summary,
         })
       } else {
-        await postConnectorEvent(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(stdout)))
+        // OpenClaw 2026.7.1 emits one JSON envelope at process completion,
+        // not NDJSON streaming frames. Emit one bounded structured delta so
+        // the protocol remains status -> delta -> final -> ack.
+        await postConnectorEvent(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
+        await postConnectorEvent(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
         // HFA-004 — exact locked recovery transcript literal.
         await postJson(state, '/api/helm-link/connector/ack', { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' })
       }
@@ -345,6 +329,47 @@ async function handleDispatch(state, dispatch) {
   }
   state.processedDispatchIds = [dispatch.id, ...state.processedDispatchIds.filter((id) => id !== dispatch.id)].slice(0, LEDGER_MAX)
   saveState(state)
+}
+
+export async function runOpenClawAdvisory({
+  args,
+  binary = resolveOpenClaw(),
+  timeoutMs = 125000,
+  env = process.env,
+} = {}) {
+  if (!Array.isArray(args)) throw new Error('OpenClaw advisory args are required.')
+  return new Promise((resolve, reject) => {
+    const child = spawn(binary, args, {
+      env: { ...env, NO_COLOR: '1' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    let stdout = ''
+    let timedOut = false
+    let overflow = false
+    const outputLimit = 1_000_000
+    const appendBounded = (current, chunk) => {
+      const next = current + chunk.toString()
+      if (Buffer.byteLength(next, 'utf8') <= outputLimit) return next
+      overflow = true
+      child.kill('SIGTERM')
+      return current
+    }
+    child.stdout.on('data', (chunk) => { stdout = appendBounded(stdout, chunk) })
+    child.once('error', reject)
+    let forceTimer = null
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGTERM')
+      forceTimer = setTimeout(() => child.kill('SIGKILL'), 2000)
+      forceTimer.unref?.()
+    }, timeoutMs)
+    timer.unref?.()
+    child.once('close', (code, signal) => {
+      clearTimeout(timer)
+      if (forceTimer) clearTimeout(forceTimer)
+      resolve({ code: code ?? 1, signal, timedOut, overflow, stdout })
+    })
+  })
 }
 
 function baseEvent(state, dispatch, kind, body) {
@@ -410,6 +435,16 @@ export function extractStructuredText(stdout) {
   try {
     const parsed = JSON.parse(cleaned)
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      // OpenClaw 2026.7.1 `agent --json` envelope. Only the documented
+      // customer payload field is accepted; metadata and raw/visible-text
+      // mirrors are deliberately ignored.
+      if (parsed.status === 'ok' && Array.isArray(parsed.result?.payloads)) {
+        const payloadText = parsed.result.payloads
+          .map((payload) => payload && typeof payload === 'object' ? payload.text : null)
+          .filter((value) => typeof value === 'string' && value.trim())
+        if (payloadText.length) return sanitizeCustomerText(payloadText.join('\n'), 100000)
+        return ''
+      }
       const kind = String(parsed.type ?? parsed.kind ?? '').toLowerCase()
       if (!['final', 'message', 'response'].includes(kind)) return ''
       const value = parsed.text ?? parsed.message ?? parsed.output
@@ -453,6 +488,11 @@ export function extractStructuredModel(stdout) {
   }
   for (const parsed of candidates.reverse()) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+    if (parsed.status === 'ok' && Array.isArray(parsed.result?.payloads)) {
+      const model = parsed.result?.meta?.agentMeta?.model
+      if (typeof model === 'string' && /^[a-z0-9._:/+-]{1,200}$/i.test(model.trim())) return model.trim()
+      return null
+    }
     const kind = String(parsed.type ?? parsed.kind ?? '').toLowerCase()
     if (!['final', 'message', 'response'].includes(kind)) continue
     const raw = parsed.modelActual ?? parsed.actualModel ?? parsed.model
