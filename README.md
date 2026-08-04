@@ -13,8 +13,8 @@ limited to the eight files under `packages/helm-link-connector/`.
   `helm-link-connector-v<package-version>`.
 - npm publication uses GitHub OIDC trusted publishing with provenance.
 - No npm token is accepted by the release workflow.
-- The deterministic `0.1.4` archive must have SHA-256
-  `0fcfd8ba8a1d44ee3a37c52b069a0086f5cfe21efbf6a8ed47380ca7cb77cfed`.
+- The deterministic `0.1.5` archive must have SHA-256
+  `43c0aa3e5fa1649fdf09d22ba8ede413c45afda5ddd2b79242c6f542e83ae1d8`.
 - `SOURCE_MANIFEST.json` pins every executable package source file.
 - CI rejects source drift, archive drift, unexpected package contents, and
   unpinned release actions.
@@ -44,5 +44,5 @@ credential.
 The public, credential-free package check is:
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.1.4' doctor --agent your-openclaw-agent-id
+npx --yes '@pharos-hq/helm-link-connector@0.1.5' doctor --agent your-openclaw-agent-id
 ```

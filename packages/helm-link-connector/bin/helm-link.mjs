@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.1.4'
+const VERSION = '0.1.5'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const SERVICE_LABEL = 'com.pharos.helm-link'
@@ -274,7 +274,7 @@ async function connect(args) {
   console.log(JSON.stringify({ connected: true, bindingId: body.binding.id, keyId: claim.keyId, service }, null, 2))
 }
 
-export function buildLaunchdPlist({ wrapper, node, connector, stateDir, openclaw, stdout, stderr }) {
+export function buildLaunchdPlist({ wrapper, node, connector, stateDir, openclaw, servicePath, stdout, stderr }) {
   const xml = (value) => String(value)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
@@ -297,6 +297,7 @@ export function buildLaunchdPlist({ wrapper, node, connector, stateDir, openclaw
   <dict>
     <key>HELM_LINK_STATE_DIR</key><string>${xml(stateDir)}</string>
     <key>HELM_LINK_OPENCLAW_BIN</key><string>${xml(openclaw)}</string>
+    <key>PATH</key><string>${xml(servicePath)}</string>
     <key>NO_COLOR</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -363,12 +364,24 @@ export function installService({ platformName = platform() } = {}) {
   chmodSync(paths.wrapper, 0o700)
 
   const openclaw = resolveOpenClawAbsolute()
+  // launchd's default PATH omits Homebrew. The OpenClaw entry point uses
+  // `#!/usr/bin/env node`, so both the exact Node and OpenClaw directories
+  // must be present or supervised dispatches fail with exit 127.
+  const servicePath = [...new Set([
+    dirname(process.execPath),
+    dirname(openclaw),
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ])].join(':')
   const plist = buildLaunchdPlist({
     wrapper: paths.wrapper,
     node: process.execPath,
     connector: paths.connector,
     stateDir: STATE_DIR,
     openclaw,
+    servicePath,
     stdout: paths.stdout,
     stderr: paths.stderr,
   })

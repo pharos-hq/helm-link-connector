@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 
 const root = mkdtempSync(join(tmpdir(), 'helm-link-launchd-'))
 const stateDir = join(root, 'state')
@@ -27,13 +28,22 @@ writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ status: 'paired' })
 const first = installService({ platformName: 'darwin' })
 const second = installService({ platformName: 'darwin' })
 assert.equal(first.installed, true)
-assert.equal(second.version, '0.1.4')
+assert.equal(second.version, '0.1.5')
 
 const plist = readFileSync(first.plist, 'utf8')
 assert.match(plist, /<key>RunAtLoad<\/key><true\/>/)
 assert.match(plist, /<key>SuccessfulExit<\/key><false\/>/)
 assert.match(plist, /HELM_LINK_STATE_DIR/)
 assert.match(plist, /HELM_LINK_OPENCLAW_BIN/)
+assert.match(plist, /<key>PATH<\/key><string>[^<]*node[^<]*<\/string>/)
+assert.match(plist, /<key>PATH<\/key><string>[^<]*tests\/fixtures[^<]*<\/string>/)
+
+const servicePath = [dirname(process.execPath), dirname(fakeOpenClaw), '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':')
+const launchdOpenClaw = spawnSync(fakeOpenClaw, ['--version'], {
+  encoding: 'utf8',
+  env: { PATH: servicePath },
+})
+assert.equal(launchdOpenClaw.status, 0, launchdOpenClaw.stderr)
 
 const calls = readFileSync(launchctlLog, 'utf8')
 assert.match(calls, /bootout gui\/\d+\/com\.pharos\.helm-link/)
