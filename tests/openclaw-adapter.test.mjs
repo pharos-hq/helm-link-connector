@@ -7,8 +7,24 @@ import {
   advisoryArgs,
   extractStructuredModel,
   extractStructuredText,
+  buildLaunchdPlist,
   runOpenClawAdvisory,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
+
+const plist = buildLaunchdPlist({
+  wrapper: '/Users/test user/.helm-link/run&supervised.sh',
+  node: '/opt/homebrew/bin/node',
+  connector: '/Users/test user/.helm-link/helm-link.mjs',
+  stateDir: '/Users/test user/.helm-link',
+  openclaw: '/opt/homebrew/bin/openclaw',
+  stdout: '/Users/test user/.helm-link/logs/out.log',
+  stderr: '/Users/test user/.helm-link/logs/err.log',
+})
+assert.match(plist, /<string>com\.pharos\.helm-link<\/string>/)
+assert.match(plist, /<key>RunAtLoad<\/key><true\/>/)
+assert.match(plist, /<key>SuccessfulExit<\/key><false\/>/)
+assert.match(plist, /run&amp;supervised\.sh/)
+assert.doesNotMatch(plist, /KeepAlive<\/key><true\/>/)
 
 const root = resolve(import.meta.dirname, '..')
 const fixture = join(root, 'tests/fixtures/fake-openclaw.mjs')
