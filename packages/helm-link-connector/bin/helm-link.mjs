@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import {
   createHash,
   createPublicKey,
@@ -8,15 +8,16 @@ import {
   randomUUID,
   sign,
 } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir, platform, release, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.1.2'
+const VERSION = '0.1.4'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
+const SERVICE_LABEL = 'com.pharos.helm-link'
 const LEDGER_MAX = 200
 const DENIED = /(^|\s)(execute|exec|shell|gateway|node|cron|cross[-_ ]session|filesystem|\/tools\/invoke|tool proxy|rm|sudo|bash|zsh)(\s|$)/i
 
@@ -25,7 +26,9 @@ function usage(exitCode = 0) {
 
 Commands:
   doctor [--agent <id>]
-  connect --server <url> --code <code> --agent <openclaw-agent-id> [--host-label <label>]
+  connect --server <url> --code <code> --agent <openclaw-agent-id> [--host-label <label>] [--install-service]
+  install-service
+  service-status
   run
   status
   disconnect
@@ -266,7 +269,131 @@ async function connect(args) {
     eventStateByDispatch: {},
     status: 'paired',
   })
-  console.log(JSON.stringify({ connected: true, bindingId: body.binding.id, keyId: claim.keyId }, null, 2))
+  let service = null
+  if (args['install-service']) service = installService()
+  console.log(JSON.stringify({ connected: true, bindingId: body.binding.id, keyId: claim.keyId, service }, null, 2))
+}
+
+export function buildLaunchdPlist({ wrapper, node, connector, stateDir, openclaw, stdout, stderr }) {
+  const xml = (value) => String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${SERVICE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xml(wrapper)}</string>
+    <string>${xml(node)}</string>
+    <string>${xml(connector)}</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HELM_LINK_STATE_DIR</key><string>${xml(stateDir)}</string>
+    <key>HELM_LINK_OPENCLAW_BIN</key><string>${xml(openclaw)}</string>
+    <key>NO_COLOR</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>${xml(stdout)}</string>
+  <key>StandardErrorPath</key><string>${xml(stderr)}</string>
+  <key>ExitTimeOut</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+`
+}
+
+function resolveOpenClawAbsolute() {
+  const configured = resolveOpenClaw()
+  if (configured.startsWith('/')) return configured
+  return execFileSync('/usr/bin/which', [configured], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim()
+}
+
+function servicePaths() {
+  const runtimeDir = join(STATE_DIR, 'runtime', VERSION)
+  const logDir = join(STATE_DIR, 'logs')
+  return {
+    runtimeDir,
+    logDir,
+    connector: join(runtimeDir, 'helm-link.mjs'),
+    wrapper: join(runtimeDir, 'run-supervised.sh'),
+    plist: join(process.env.HELM_LINK_LAUNCH_AGENTS_DIR || join(homedir(), 'Library', 'LaunchAgents'), `${SERVICE_LABEL}.plist`),
+    stdout: join(logDir, 'connector.out.log'),
+    stderr: join(logDir, 'connector.err.log'),
+  }
+}
+
+function runLaunchctl(args, { allowFailure = false } = {}) {
+  const binary = process.env.HELM_LINK_LAUNCHCTL_BIN || '/bin/launchctl'
+  const result = spawnSync(binary, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  if (!allowFailure && result.status !== 0) {
+    throw new Error(`launchctl ${args[0]} failed: ${(result.stderr || result.stdout || `exit ${result.status}`).trim()}`)
+  }
+  return result
+}
+
+export function installService({ platformName = platform() } = {}) {
+  if (platformName !== 'darwin') {
+    throw new Error('install-service currently supports macOS launchd only; use the packaged systemd/container supervisor on other hosts.')
+  }
+  const state = loadState()
+  if (!state) throw new Error('No connector state. Run connect first.')
+  if (state.status === 'revoked') throw new Error('Revoked connector state cannot be supervised. Reconnect with a fresh enrollment.')
+
+  const paths = servicePaths()
+  mkdirPrivate(paths.runtimeDir)
+  mkdirPrivate(paths.logDir)
+  mkdirSync(dirname(paths.plist), { recursive: true, mode: 0o700 })
+
+  writeFileSync(paths.connector, readFileSync(__filename), { mode: 0o700 })
+  chmodSync(paths.connector, 0o700)
+  const packagedWrapper = join(dirname(__filename), '..', 'supervisors', 'run-supervised.sh')
+  writeFileSync(paths.wrapper, readFileSync(packagedWrapper), { mode: 0o700 })
+  chmodSync(paths.wrapper, 0o700)
+
+  const openclaw = resolveOpenClawAbsolute()
+  const plist = buildLaunchdPlist({
+    wrapper: paths.wrapper,
+    node: process.execPath,
+    connector: paths.connector,
+    stateDir: STATE_DIR,
+    openclaw,
+    stdout: paths.stdout,
+    stderr: paths.stderr,
+  })
+  writeFileSync(paths.plist, plist, { mode: 0o600 })
+
+  const domain = `gui/${process.getuid()}`
+  const target = `${domain}/${SERVICE_LABEL}`
+  runLaunchctl(['bootout', target], { allowFailure: true })
+  runLaunchctl(['bootstrap', domain, paths.plist])
+  runLaunchctl(['enable', target])
+  runLaunchctl(['kickstart', '-k', target])
+
+  return { installed: true, label: SERVICE_LABEL, plist: paths.plist, version: VERSION }
+}
+
+function serviceStatus() {
+  if (platform() !== 'darwin') throw new Error('service-status currently supports macOS launchd only.')
+  const target = `gui/${process.getuid()}/${SERVICE_LABEL}`
+  const result = runLaunchctl(['print', target], { allowFailure: true })
+  console.log(JSON.stringify({
+    label: SERVICE_LABEL,
+    installed: result.status === 0,
+    stateFile: STATE_FILE,
+    version: VERSION,
+  }, null, 2))
 }
 
 async function presence(state, value = 'online') {
@@ -623,6 +750,8 @@ if (invokedDirectly) {
     if (!cmd || args.help) usage()
     if (cmd === 'doctor') await doctor(args)
     else if (cmd === 'connect') await connect(args)
+    else if (cmd === 'install-service') console.log(JSON.stringify(installService(), null, 2))
+    else if (cmd === 'service-status') serviceStatus()
     else if (cmd === 'run') await runLoop()
     else if (cmd === 'status') await status()
     else if (cmd === 'disconnect') await disconnect()

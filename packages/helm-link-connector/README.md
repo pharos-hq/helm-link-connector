@@ -7,7 +7,7 @@ OpenClaw agent to Helm Link.
 
 Helm generates a private connection command pinned to an exact public package
 version. Never replace that version with `latest`, reuse an expired connection
-code, or paste or screenshot the command. Version `0.1.2` is eligible for
+code, or paste or screenshot the command. Version `0.1.4` is eligible for
 publication only through the repository's tag-bound GitHub OIDC workflow with
 npm provenance.
 
@@ -18,7 +18,7 @@ hosted round trip. Follow `docs/HELM_LINK_SUPERVISED_PILOT_RUNBOOK.md` for the
 actual-custody gate.
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.1.2' doctor --agent your-openclaw-agent-id
+npx --yes '@pharos-hq/helm-link-connector@0.1.4' doctor --agent your-openclaw-agent-id
 ```
 
 Connection codes are intentionally omitted from documentation. Generate the
@@ -30,6 +30,23 @@ OpenClaw is resolved from `HELM_LINK_OPENCLAW_BIN`, then `OPENCLAW_BIN`, then
 `--deliver`, and never sends to Telegram, WhatsApp, Discord, or another channel.
 Advisory text is passed through a mode-`0600` temporary `--message-file`, not
 through process arguments.
+
+## Installed macOS lifecycle
+
+The Helm-generated macOS enrollment command ends with `--install-service`.
+After the short-lived pairing succeeds, the connector installs an exact-version
+private runtime under `~/.helm-link/runtime/`, writes a mode-0600 LaunchAgent,
+and loads `com.pharos.helm-link`. `RunAtLoad` covers login/reboot and
+`KeepAlive.SuccessfulExit=false` recovers transient crashes while the packaged
+revocation wrapper maps terminal exit 75 to a clean stop.
+
+For an already paired Mac, install supervision without replacing the binding,
+key, transcript, or local state:
+
+```bash
+npx --yes '@pharos-hq/helm-link-connector@0.1.4' install-service
+npx --yes '@pharos-hq/helm-link-connector@0.1.4' service-status
+```
 
 ## Supervisor templates
 
@@ -44,9 +61,9 @@ Ready-to-substitute templates live under `supervisors/`:
 - `supervisors/run-supervised.sh` — maps terminal revocation exit 75
   to a clean supervisor stop while preserving transient error codes.
 
-Each template contains substitution placeholders (paths, users, state
-directory) that must be filled before install. Do not deploy the raw
-templates as-is.
+The systemd/container templates contain substitution placeholders that must be
+filled before installation. The macOS template is retained as an audited
+contract; the CLI now renders and installs the concrete LaunchAgent itself.
 
 ## macOS launchd
 

@@ -18,10 +18,10 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.1.2')
+  assert.equal(manifest.version, '0.1.4')
   assert.equal(
     manifest.archive.sha256,
-    'a29d0d25d4c46d4bd34cb7de7831a4fb373db8bdc2825e97c53e1b307096f842',
+    '0fcfd8ba8a1d44ee3a37c52b069a0086f5cfe21efbf6a8ed47380ca7cb77cfed',
   )
   assert.equal(Object.keys(manifest.files).length, 8)
 
