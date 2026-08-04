@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      EXPECTED_SHA256: 0fcfd8ba8a1d44ee3a37c52b069a0086f5cfe21efbf6a8ed47380ca7cb77cfed
+      EXPECTED_SHA256: 43c0aa3e5fa1649fdf09d22ba8ede413c45afda5ddd2b79242c6f542e83ae1d8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -40,21 +40,21 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/package-helm-link-connector.mjs --out-dir /tmp/helm-link-publish
-          archive=/tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.4.tgz
+          archive=/tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.5.tgz
           test "$(find /tmp/helm-link-publish -maxdepth 1 -name '*.tgz' | wc -l | tr -d ' ')" = 1
           test "$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_SHA256"
           (cd /tmp/helm-link-publish && sha256sum --check SHA256SUMS)
       - name: Publish public package with npm provenance
-        run: npm publish /tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.4.tgz --access public --tag latest --provenance
+        run: npm publish /tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.5.tgz --access public --tag latest --provenance
       - name: Verify registry integrity, tags, and attestation receipt
         shell: bash
         run: |
           set -euo pipefail
           for attempt in $(seq 1 12); do
-            version="$(npm view '@pharos-hq/helm-link-connector@0.1.4' version 2>/dev/null || true)"
-            if [[ "$version" = '0.1.4' ]]; then break; fi
+            version="$(npm view '@pharos-hq/helm-link-connector@0.1.5' version 2>/dev/null || true)"
+            if [[ "$version" = '0.1.5' ]]; then break; fi
             sleep 5
           done
-          test "$version" = '0.1.4'
-          test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.1.4'
-          npm view '@pharos-hq/helm-link-connector@0.1.4' dist.integrity dist.shasum dist.attestations --json
+          test "$version" = '0.1.5'
+          test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.1.5'
+          npm view '@pharos-hq/helm-link-connector@0.1.5' dist.integrity dist.shasum dist.attestations --json
