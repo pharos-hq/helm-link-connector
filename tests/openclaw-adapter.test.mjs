@@ -12,6 +12,7 @@ import {
   deriveLivenessPresence,
   postJson,
   runOpenClawAdvisory,
+  registerInvocationClaim,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
 
 const plist = buildLaunchdPlist({
@@ -114,6 +115,27 @@ await assert.rejects(
   }),
   (error) => error?.code === 'helm_link_request_timeout',
 )
+
+let registered = null
+await registerInvocationClaim({ bindingId: 'binding-fixture' }, {
+  dispatchId: 'dispatch-fixture',
+  invocationId: 'invocation-fixture',
+  fencingToken: 4,
+}, {
+  postImpl: async (_state, path, body) => {
+    registered = { path, body }
+    return { accepted: true }
+  },
+})
+assert.deepEqual(registered, {
+  path: '/api/helm-link/connector/claims',
+  body: {
+    protocolVersion: 'helm-link.longpoll.v1',
+    dispatchId: 'dispatch-fixture',
+    invocationId: 'invocation-fixture',
+    fencingToken: 4,
+  },
+})
 await assert.rejects(
   postJson({
     server: 'https://example.invalid',
@@ -134,6 +156,7 @@ console.log('VERIFIED OpenClaw 2026.7.1 structured-output contract')
 console.log('VERIFIED malformed, non-zero, timeout, and zero-content fail closed')
 console.log('VERIFIED bounded HTTP headers/body and data-plane-derived presence')
 console.log('VERIFIED typed termination diagnostics and independent stdout/stderr counters')
+console.log('VERIFIED local claim is registered with server before spawn')
 
 async function runScenario(scenario, timeoutMs = 2000) {
   return runOpenClawAdvisory({

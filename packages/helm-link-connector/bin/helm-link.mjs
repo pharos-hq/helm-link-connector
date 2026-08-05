@@ -505,6 +505,13 @@ async function handleDispatch(state, dispatch, liveness) {
     invocationId,
   })
   journal('invocation_claimed', claim)
+  await registerInvocationClaim(state, claim)
+  journal('invocation_claim_registered', {
+    dispatchId: dispatch.id,
+    bindingId: state.bindingId,
+    invocationId,
+    fencingToken: claim.fencingToken,
+  })
   const text = dispatch.payload?.text
   const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
   liveness.activeDispatchId = dispatch.id
@@ -559,6 +566,15 @@ async function handleDispatch(state, dispatch, liveness) {
     liveness.activeDispatchId = null
     liveness.activeDispatchStartedAt = null
   }
+}
+
+export async function registerInvocationClaim(state, claim, { postImpl = postJson } = {}) {
+  return postImpl(state, '/api/helm-link/connector/claims', {
+    protocolVersion: PROTOCOL,
+    dispatchId: claim.dispatchId,
+    invocationId: claim.invocationId,
+    fencingToken: claim.fencingToken,
+  })
 }
 
 export async function runOpenClawAdvisory({
