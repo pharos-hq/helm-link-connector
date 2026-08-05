@@ -2,15 +2,15 @@
   "schemaVersion": 1,
   "package": "@pharos-hq/helm-link-connector",
   "version": "0.2.0-architecture.0",
-  "reviewedPredecessorCommit": "d317cb1",
+  "reviewedPredecessorCommit": "a59bf3d",
   "archive": {
     "filename": "pharos-hq-helm-link-connector-0.2.0-architecture.0.tgz",
-    "sha256": "4fbddcd5191423387610ff11e3337b14b808e774b36b9c4b23ddfc90a5ca3b97"
+    "sha256": "6381ede68579c493a61c8a18936dc5ccb410eacf9e99cc58e4fb726be8bfaf8b"
   },
   "files": {
     "packages/helm-link-connector/LICENSE": "b65e3c1127db9c0ecee1f0cbf48e609422ba1555d389b759199d47c5bd13f3ac",
     "packages/helm-link-connector/README.md": "445954549f5f35548c7345f57ac9cc851efa7785d0651c8c5de94b1c8f688914",
-    "packages/helm-link-connector/bin/helm-link.mjs": "9c5b50fa0733be86ccb65132a67be1de8834efaf4c34a515c881f1a2516d4be5",
+    "packages/helm-link-connector/bin/helm-link.mjs": "92d6e29aae98f837da1a86a476b4a094b04623d4b1ff86a9edf3104ff6b0a85d",
     "packages/helm-link-connector/lib/invocation-claims.mjs": "b46eb7a40205517824a04a89362c0e9d5f7f407dbbdfe31cfdbfb5bf745980d0",
     "packages/helm-link-connector/lib/lifecycle-journal.mjs": "e6b8e06615ac9b1ca6a365955716ebeec90239f199dc710b86c21296f7dcfbf9",
     "packages/helm-link-connector/lib/terminal-store.mjs": "ce6fafeda4a2a77864f5af70d8293e50cb5d15ed2b57bec11234d074c9da78b9",
