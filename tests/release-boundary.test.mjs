@@ -18,10 +18,10 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.1.6')
+  assert.equal(manifest.version, '0.1.7')
   assert.equal(
     manifest.archive.sha256,
-    '70beeaa9ebec0908f48168639b84ee0f68ed519f30173674f68148e11b5a682a',
+    '162c9f617699fc45fc4a00d0f2c21c01eded20299c6e90ecd01624da1db3d75f',
   )
   assert.equal(Object.keys(manifest.files).length, 8)
 
@@ -55,6 +55,7 @@ try {
   assert.match(workflow, /id-token: write/)
   assert.match(workflow, /--provenance/)
   assert.match(workflow, /EXPECTED_SHA256/)
+  assert.match(workflow, new RegExp(manifest.archive.sha256))
   assert.doesNotMatch(
     workflow,
     /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|npm login|npm adduser/,
