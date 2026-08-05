@@ -15,6 +15,14 @@ import { fileURLToPath } from 'node:url'
 import { performance } from 'node:perf_hooks'
 import { createLifecycleJournal } from '../lib/lifecycle-journal.mjs'
 import { claimInvocation } from '../lib/invocation-claims.mjs'
+import {
+  markTerminalDelivered,
+  migrateProcessedLedger,
+  pendingTerminalOutbox,
+  readTerminalRecord,
+  recordTerminal,
+  writeTerminalOutbox,
+} from '../lib/terminal-store.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
 const VERSION = '0.1.9'
@@ -473,17 +481,30 @@ async function presence(state, liveness, value = deriveLivenessPresence(liveness
 }
 
 async function acknowledgeTerminal(state, dispatch, acknowledgement, liveness) {
-  if (!state.pendingAcks) state.pendingAcks = {}
-  state.pendingAcks[dispatch.id] = acknowledgement
-  saveState(state)
-  await postJson(state, '/api/helm-link/connector/ack', acknowledgement)
-  delete state.pendingAcks[dispatch.id]
-  state.processedDispatchIds = [dispatch.id, ...state.processedDispatchIds.filter((id) => id !== dispatch.id)].slice(0, LEDGER_MAX)
+  const durableAck = {
+    ...acknowledgement,
+    invocationId: acknowledgement.invocationId || state.activeInvocationId || null,
+    invocationFencingToken: Number(state.fencingToken || 0),
+    deliveryFencingToken: Number(state.fencingToken || 0),
+  }
+  recordTerminal(STATE_DIR, {
+    ...durableAck,
+    bindingId: state.bindingId,
+  })
+  writeTerminalOutbox(STATE_DIR, durableAck)
+  await postJson(state, '/api/helm-link/connector/ack', durableAck)
+  markTerminalDelivered(STATE_DIR, dispatch.id)
   liveness.lastDispatchProgressAt = Date.now()
   saveState(state)
 }
 
 async function flushPendingAcks(state, liveness) {
+  for (const acknowledgement of pendingTerminalOutbox(STATE_DIR)) {
+    const deliverable = prepareTerminalDelivery(state, acknowledgement)
+    await postJson(state, '/api/helm-link/connector/ack', deliverable)
+    markTerminalDelivered(STATE_DIR, acknowledgement.dispatchId)
+    liveness.lastDispatchProgressAt = Date.now()
+  }
   for (const [dispatchId, acknowledgement] of Object.entries(state.pendingAcks || {})) {
     await postJson(state, '/api/helm-link/connector/ack', acknowledgement)
     delete state.pendingAcks[dispatchId]
@@ -493,8 +514,15 @@ async function flushPendingAcks(state, liveness) {
   }
 }
 
+export function prepareTerminalDelivery(state, acknowledgement) {
+  return {
+    ...acknowledgement,
+    deliveryFencingToken: Number(state.fencingToken || 0),
+  }
+}
+
 async function handleDispatch(state, dispatch, liveness) {
-  if (state.processedDispatchIds.includes(dispatch.id)) return
+  if (readTerminalRecord(STATE_DIR, dispatch.id)) return
   if (state.pendingAcks?.[dispatch.id]) {
     await flushPendingAcks(state, liveness)
     return
@@ -517,6 +545,7 @@ async function handleDispatch(state, dispatch, liveness) {
   })
   const text = dispatch.payload?.text
   const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
+  state.activeInvocationId = invocationId
   liveness.activeDispatchId = dispatch.id
   liveness.activeDispatchStartedAt = Date.now()
   try {
@@ -568,6 +597,7 @@ async function handleDispatch(state, dispatch, liveness) {
     invocation.cleanup()
     liveness.activeDispatchId = null
     liveness.activeDispatchStartedAt = null
+    delete state.activeInvocationId
   }
 }
 
@@ -861,6 +891,7 @@ function sanitizeCustomerText(value, limit) {
 async function runLoop() {
   const state = loadState()
   if (!state) throw new Error('No connector state. Run connect first.')
+  migrateProcessedLedger(STATE_DIR, state)
   await acquireBindingFence(state)
   const liveness = {
     lastPollCompletedAt: 0,
