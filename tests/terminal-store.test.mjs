@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import {
   markTerminalDelivered, migrateProcessedLedger, pendingTerminalOutbox, readTerminalRecord,
   recordTerminal, writeTerminalOutbox,
+  recoverAmbiguousInvocations,
 } from '../packages/helm-link-connector/lib/terminal-store.mjs'
 import { prepareTerminalDelivery } from '../packages/helm-link-connector/bin/helm-link.mjs'
 
@@ -37,8 +38,22 @@ try {
   })
   assert.equal(redelivered.invocationFencingToken, 8)
   assert.equal(redelivered.deliveryFencingToken, 10)
+
+  const ambiguous = recoverAmbiguousInvocations(root, { fencingToken: 9 }, [{
+    dispatchId: 'ambiguous-dispatch', bindingId: 'binding-fixture',
+    invocationId: 'invocation-ambiguous', fencingToken: 8,
+  }])
+  assert.equal(ambiguous[0]?.terminalCode, 'execution_outcome_unknown')
+  assert.equal(pendingTerminalOutbox(root)[0]?.recovery, true)
+  assert.equal(pendingTerminalOutbox(root)[0]?.invocationFencingToken, 8)
+  assert.equal(pendingTerminalOutbox(root)[0]?.deliveryFencingToken, 9)
+  assert.equal(recoverAmbiguousInvocations(root, { fencingToken: 10 }, [{
+    dispatchId: 'ambiguous-dispatch', bindingId: 'binding-fixture',
+    invocationId: 'invocation-ambiguous', fencingToken: 8,
+  }]).length, 0)
   console.log('VERIFIED original terminal dispatch remains absorbing after restart and cache pruning')
   console.log('VERIFIED durable terminal outbox delivery marker')
+  console.log('VERIFIED ambiguous invocation becomes no-replay terminal exactly once')
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

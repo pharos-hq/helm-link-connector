@@ -104,3 +104,32 @@ export function migrateProcessedLedger(root, state) {
   }
   return migrated
 }
+
+export function recoverAmbiguousInvocations(root, state, claims) {
+  const recovered = []
+  for (const claim of claims) {
+    if (readTerminalRecord(root, claim.dispatchId)) continue
+    const terminal = recordTerminal(root, {
+      dispatchId: claim.dispatchId,
+      bindingId: claim.bindingId,
+      invocationId: claim.invocationId,
+      invocationFencingToken: Number(claim.fencingToken || 0),
+      state: 'failed',
+      terminalCode: 'execution_outcome_unknown',
+      terminalSummary: 'A durable invocation claim survived without a trusted terminal result; replay is forbidden.',
+    })
+    writeTerminalOutbox(root, {
+      protocolVersion: 'helm-link.longpoll.v1',
+      dispatchId: claim.dispatchId,
+      invocationId: claim.invocationId,
+      invocationFencingToken: Number(claim.fencingToken || 0),
+      deliveryFencingToken: Number(state.fencingToken || 0),
+      state: 'failed',
+      terminalCode: 'execution_outcome_unknown',
+      terminalSummary: terminal.terminalSummary,
+      recovery: true,
+    })
+    recovered.push(terminal)
+  }
+  return recovered
+}

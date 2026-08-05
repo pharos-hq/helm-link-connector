@@ -14,13 +14,14 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { performance } from 'node:perf_hooks'
 import { createLifecycleJournal } from '../lib/lifecycle-journal.mjs'
-import { claimInvocation } from '../lib/invocation-claims.mjs'
+import { claimInvocation, listInvocationClaims, markInvocationStarted } from '../lib/invocation-claims.mjs'
 import {
   markTerminalDelivered,
   migrateProcessedLedger,
   pendingTerminalOutbox,
   readTerminalRecord,
   recordTerminal,
+  recoverAmbiguousInvocations,
   writeTerminalOutbox,
 } from '../lib/terminal-store.mjs'
 
@@ -501,7 +502,9 @@ async function acknowledgeTerminal(state, dispatch, acknowledgement, liveness) {
 async function flushPendingAcks(state, liveness) {
   for (const acknowledgement of pendingTerminalOutbox(STATE_DIR)) {
     const deliverable = prepareTerminalDelivery(state, acknowledgement)
-    await postJson(state, '/api/helm-link/connector/ack', deliverable)
+    await postJson(state, acknowledgement.recovery
+      ? '/api/helm-link/connector/recoveries'
+      : '/api/helm-link/connector/ack', deliverable)
     markTerminalDelivered(STATE_DIR, acknowledgement.dispatchId)
     liveness.lastDispatchProgressAt = Date.now()
   }
@@ -558,6 +561,13 @@ async function handleDispatch(state, dispatch, liveness) {
         dispatchId: dispatch.id,
         bindingId: state.bindingId,
         ...fields,
+      }),
+      onSpawn: ({ pid, startedAt }) => markInvocationStarted(STATE_DIR, dispatch.id, {
+        invocationId,
+        bindingId: state.bindingId,
+        fencingToken: Number(state.fencingToken || 0),
+        pid,
+        startedAt,
       }),
     })
     if (result.timedOut) {
@@ -616,6 +626,7 @@ export async function runOpenClawAdvisory({
   timeoutMs = 125000,
   env = process.env,
   lifecycle = () => {},
+  onSpawn = () => {},
   outputLimit = 1_000_000,
 } = {}) {
   if (!Array.isArray(args)) throw new Error('OpenClaw advisory args are required.')
@@ -643,6 +654,15 @@ export async function runOpenClawAdvisory({
     let stdoutTruncated = false
     let stderrTruncated = false
     lifecycle('spawned', { pid: child.pid || null, startedAt })
+    try {
+      onSpawn({ pid: child.pid || null, startedAt })
+    } catch (error) {
+      lifecycle('spawn_state_error', { pid: child.pid || null, errorCode: error?.code || null })
+      child.once('error', () => {})
+      child.kill('SIGKILL')
+      reject(error)
+      return
+    }
     const appendBounded = (stream, current, chunk) => {
       const bytes = Buffer.byteLength(chunk)
       if (stream === 'stdout') {
@@ -893,6 +913,7 @@ async function runLoop() {
   if (!state) throw new Error('No connector state. Run connect first.')
   migrateProcessedLedger(STATE_DIR, state)
   await acquireBindingFence(state)
+  recoverAmbiguousInvocations(STATE_DIR, state, listInvocationClaims(STATE_DIR))
   const liveness = {
     lastPollCompletedAt: 0,
     pollStartedAt: 0,

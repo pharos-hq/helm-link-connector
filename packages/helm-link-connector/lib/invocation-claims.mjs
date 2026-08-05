@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync, writeSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 export class InvocationAlreadyClaimedError extends Error {
@@ -66,4 +66,21 @@ export function claimInvocation(root, input) {
   closeSync(fd)
   fsyncDirectory(dirname(file))
   return record
+}
+
+export function listInvocationClaims(root) {
+  const dir = join(root, 'invocations')
+  if (!existsSync(dir)) return []
+  return readdirSync(dir).filter((name) => name.endsWith('.json')).sort()
+    .map((name) => JSON.parse(readFileSync(join(dir, name), 'utf8')))
+}
+
+export function markInvocationStarted(root, dispatchId, fields) {
+  assertIdentifier('dispatch id', dispatchId)
+  const file = join(root, 'invocation-started', `${dispatchId}.json`)
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+  writeFileSync(file, `${JSON.stringify({
+    schema: 'helm-link.invocation-started.v1', dispatchId, ...fields,
+  })}\n`, { mode: 0o600, flag: 'wx', flush: true })
+  fsyncDirectory(dirname(file))
 }
