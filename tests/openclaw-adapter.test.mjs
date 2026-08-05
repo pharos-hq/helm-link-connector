@@ -13,6 +13,7 @@ import {
   postJson,
   runOpenClawAdvisory,
   registerInvocationClaim,
+  acquireBindingFence,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
 
 const plist = buildLaunchdPlist({
@@ -136,6 +137,17 @@ assert.deepEqual(registered, {
     fencingToken: 4,
   },
 })
+
+const fencedState = { fencingToken: 3 }
+assert.equal(await acquireBindingFence(fencedState, {
+  postImpl: async () => ({ fencingToken: 4, issuedAt: '2026-08-05T14:00:00.000Z' }),
+  persist: () => {},
+}), 4)
+assert.equal(fencedState.fencingToken, 4)
+await assert.rejects(
+  acquireBindingFence(fencedState, { postImpl: async () => ({ fencingToken: 4 }), persist: () => {} }),
+  /non-monotonic fencing token/,
+)
 await assert.rejects(
   postJson({
     server: 'https://example.invalid',
@@ -157,6 +169,7 @@ console.log('VERIFIED malformed, non-zero, timeout, and zero-content fail closed
 console.log('VERIFIED bounded HTTP headers/body and data-plane-derived presence')
 console.log('VERIFIED typed termination diagnostics and independent stdout/stderr counters')
 console.log('VERIFIED local claim is registered with server before spawn')
+console.log('VERIFIED connector acquires and persists monotonic fencing ownership')
 
 async function runScenario(scenario, timeoutMs = 2000) {
   return runOpenClawAdvisory({

@@ -196,6 +196,9 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
         'x-helm-link-nonce': nonce,
         'x-helm-link-body-sha256': hash,
         'x-helm-link-signature': signature,
+        ...(Number.isSafeInteger(state.fencingToken)
+          ? { 'x-helm-link-fencing-token': String(state.fencingToken) }
+          : {}),
       },
       body: raw,
       signal: controller.signal,
@@ -858,6 +861,7 @@ function sanitizeCustomerText(value, limit) {
 async function runLoop() {
   const state = loadState()
   if (!state) throw new Error('No connector state. Run connect first.')
+  await acquireBindingFence(state)
   const liveness = {
     lastPollCompletedAt: 0,
     pollStartedAt: 0,
@@ -906,6 +910,20 @@ async function runLoop() {
       await sleep(5000)
     }
   }
+}
+
+export async function acquireBindingFence(state, { postImpl = postJson, persist = saveState } = {}) {
+  const response = await postImpl(state, '/api/helm-link/connector/ownership', {
+    protocolVersion: PROTOCOL,
+  })
+  const fencingToken = Number(response?.fencingToken)
+  if (!Number.isSafeInteger(fencingToken) || fencingToken <= Number(state.fencingToken || 0)) {
+    throw new Error('Server returned a non-monotonic fencing token.')
+  }
+  state.fencingToken = fencingToken
+  state.fenceIssuedAt = response.issuedAt || new Date().toISOString()
+  persist(state)
+  return fencingToken
 }
 
 function sleep(ms) {
