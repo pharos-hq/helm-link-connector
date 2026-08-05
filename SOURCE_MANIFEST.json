@@ -1,17 +1,17 @@
 {
   "schemaVersion": 1,
   "package": "@pharos-hq/helm-link-connector",
-  "version": "0.1.5",
-  "reviewedPredecessorCommit": "abf0ac73ef40f6f12caf78689a1ea19d9f1f5823",
+  "version": "0.1.6",
+  "reviewedPredecessorCommit": "f7b0fcb2084056f58335108112c9de77027edeeb",
   "archive": {
-    "filename": "pharos-hq-helm-link-connector-0.1.5.tgz",
-    "sha256": "43c0aa3e5fa1649fdf09d22ba8ede413c45afda5ddd2b79242c6f542e83ae1d8"
+    "filename": "pharos-hq-helm-link-connector-0.1.6.tgz",
+    "sha256": "70beeaa9ebec0908f48168639b84ee0f68ed519f30173674f68148e11b5a682a"
   },
   "files": {
     "packages/helm-link-connector/LICENSE": "b65e3c1127db9c0ecee1f0cbf48e609422ba1555d389b759199d47c5bd13f3ac",
-    "packages/helm-link-connector/README.md": "e70a1abb19c03c07453a6f4b4e69ba292f6ce183a729b6e8a4ab3f4a5a05dcc9",
-    "packages/helm-link-connector/bin/helm-link.mjs": "872456ebb0d65d4a9f0fd39705159925e10673e8d1b75f6ad4ac08757a49d7e5",
-    "packages/helm-link-connector/package.json": "f57ae3d0e4ac4d59f12075053a61a7bdbdffe38f480bfc6d3542df7fabd30ecf",
+    "packages/helm-link-connector/README.md": "8538de150bafa843ce394926a942e2e0a422bb8cf15631b948f6002d25366303",
+    "packages/helm-link-connector/bin/helm-link.mjs": "1eb786f145d593b351381ddee3670955de27178f6b14909986d4c3880e513b2c",
+    "packages/helm-link-connector/package.json": "3f9311d83f3610c16bf3fe18bfcbac6653639f8314aca5ff6921ac85103ebd3f",
     "packages/helm-link-connector/supervisors/container/docker-compose.yml": "4b43486c057c393dabb78c54757fd3a07e899b5e8d57e0cf7a90c223b332249b",
     "packages/helm-link-connector/supervisors/launchd/com.helm.link.plist": "7b3a7865405f05d7011cc28c000c50bd2207eeac851d26fceecc50d67fa20e05",
     "packages/helm-link-connector/supervisors/run-supervised.sh": "6886b0c1e1f6826a3a04807128799b5ba8696e3ea63e61b7237783f8eeb13910",

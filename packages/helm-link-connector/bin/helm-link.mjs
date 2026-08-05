@@ -14,11 +14,13 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.1.5'
+const VERSION = '0.1.6'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const SERVICE_LABEL = 'com.pharos.helm-link'
 const LEDGER_MAX = 200
+const HTTP_REQUEST_TIMEOUT_MS = 20_000
+const DATA_PLANE_STALE_MS = 90_000
 const DENIED = /(^|\s)(execute|exec|shell|gateway|node|cron|cross[-_ ]session|filesystem|\/tools\/invoke|tool proxy|rm|sudo|bash|zsh)(\s|$)/i
 
 function usage(exitCode = 0) {
@@ -170,24 +172,39 @@ function eventHash(event) {
   return createHash('sha256').update(canonical(event)).digest('hex')
 }
 
-async function postJson(state, pathname, body) {
+export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST_TIMEOUT_MS, fetchImpl = fetch } = {}) {
   const raw = JSON.stringify(body)
   const timestamp = new Date().toISOString()
   const nonce = randomBytes(18).toString('base64url')
   const hash = bodyHash(raw)
   const signature = sign(null, Buffer.from(canonicalRequest('POST', pathname, state.bindingId, timestamp, nonce, hash)), state.privateKeyPem).toString('base64')
-  const res = await fetch(new URL(pathname, state.server).toString(), {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-helm-link-binding-id': state.bindingId,
-      'x-helm-link-timestamp': timestamp,
-      'x-helm-link-nonce': nonce,
-      'x-helm-link-body-sha256': hash,
-      'x-helm-link-signature': signature,
-    },
-    body: raw,
-  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let res
+  try {
+    res = await fetchImpl(new URL(pathname, state.server).toString(), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-helm-link-binding-id': state.bindingId,
+        'x-helm-link-timestamp': timestamp,
+        'x-helm-link-nonce': nonce,
+        'x-helm-link-body-sha256': hash,
+        'x-helm-link-signature': signature,
+      },
+      body: raw,
+      signal: controller.signal,
+    })
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const timeoutError = new Error(`Connector request timed out after ${timeoutMs}ms: ${pathname}`)
+      timeoutError.code = 'helm_link_request_timeout'
+      throw timeoutError
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
   const text = await res.text()
   const json = text ? JSON.parse(text) : {}
   if (!res.ok) {
@@ -409,7 +426,18 @@ function serviceStatus() {
   }, null, 2))
 }
 
-async function presence(state, value = 'online') {
+export function deriveLivenessPresence(liveness, nowMs = Date.now()) {
+  if (!liveness.lastPollCompletedAt) return 'connecting'
+  const latestProgress = Math.max(
+    liveness.lastPollCompletedAt || 0,
+    liveness.lastDispatchProgressAt || 0,
+  )
+  const pollHung = liveness.pollStartedAt && nowMs - liveness.pollStartedAt >= HTTP_REQUEST_TIMEOUT_MS
+  const dataPlaneStale = nowMs - latestProgress >= DATA_PLANE_STALE_MS
+  return pollHung || dataPlaneStale ? 'degraded' : 'online'
+}
+
+async function presence(state, liveness, value = deriveLivenessPresence(liveness)) {
   return postJson(state, '/api/helm-link/connector/presence', {
     protocolVersion: PROTOCOL,
     presence: value,
@@ -420,25 +448,61 @@ async function presence(state, value = 'online') {
     openclawVersion: openclawVersion(),
     compatibility: 'supported',
     runtimeModel: runtimeModelForAgent(state.runtimeAgentId),
-    diagnostics: { openclaw: resolveOpenClaw() },
+    diagnostics: {
+      openclaw: resolveOpenClaw(),
+      dataPlane: value === 'online' ? 'healthy' : value,
+      lastPollCompletedAt: liveness.lastPollCompletedAt ? new Date(liveness.lastPollCompletedAt).toISOString() : null,
+      lastDispatchProgressAt: liveness.lastDispatchProgressAt ? new Date(liveness.lastDispatchProgressAt).toISOString() : null,
+      activeDispatchId: liveness.activeDispatchId,
+      activeDispatchStartedAt: liveness.activeDispatchStartedAt ? new Date(liveness.activeDispatchStartedAt).toISOString() : null,
+      requestTimeoutMs: HTTP_REQUEST_TIMEOUT_MS,
+    },
   })
 }
 
-async function handleDispatch(state, dispatch) {
+async function acknowledgeTerminal(state, dispatch, acknowledgement, liveness) {
+  if (!state.pendingAcks) state.pendingAcks = {}
+  state.pendingAcks[dispatch.id] = acknowledgement
+  saveState(state)
+  await postJson(state, '/api/helm-link/connector/ack', acknowledgement)
+  delete state.pendingAcks[dispatch.id]
+  state.processedDispatchIds = [dispatch.id, ...state.processedDispatchIds.filter((id) => id !== dispatch.id)].slice(0, LEDGER_MAX)
+  liveness.lastDispatchProgressAt = Date.now()
+  saveState(state)
+}
+
+async function flushPendingAcks(state, liveness) {
+  for (const [dispatchId, acknowledgement] of Object.entries(state.pendingAcks || {})) {
+    await postJson(state, '/api/helm-link/connector/ack', acknowledgement)
+    delete state.pendingAcks[dispatchId]
+    state.processedDispatchIds = [dispatchId, ...state.processedDispatchIds.filter((id) => id !== dispatchId)].slice(0, LEDGER_MAX)
+    liveness.lastDispatchProgressAt = Date.now()
+    saveState(state)
+  }
+}
+
+async function handleDispatch(state, dispatch, liveness) {
   if (state.processedDispatchIds.includes(dispatch.id)) return
+  if (state.pendingAcks?.[dispatch.id]) {
+    await flushPendingAcks(state, liveness)
+    return
+  }
   const text = dispatch.payload?.text
   const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
-  await postConnectorEvent(state, statusEvent(state, dispatch, 'working'))
+  liveness.activeDispatchId = dispatch.id
+  liveness.activeDispatchStartedAt = Date.now()
   try {
+    await postConnectorEvent(state, statusEvent(state, dispatch, 'working'))
+    liveness.lastDispatchProgressAt = Date.now()
     const result = await runOpenClawAdvisory({ args: invocation.args })
     if (result.timedOut) {
       const summary = 'OpenClaw advisory timed out; no customer content produced.'
       await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await postJson(state, '/api/helm-link/connector/ack', { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_timeout', terminalSummary: summary })
+      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_timeout', terminalSummary: summary }, liveness)
     } else if (result.code !== 0 || result.overflow) {
       const summary = 'OpenClaw advisory failed; no customer content produced.'
       await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await postJson(state, '/api/helm-link/connector/ack', { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_failed', terminalSummary: summary })
+      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_failed', terminalSummary: summary }, liveness)
     } else {
       // HFA-004 — extractText requires structured output; if OpenClaw
       // produced no parseable response frame the run is treated as a
@@ -447,13 +511,13 @@ async function handleDispatch(state, dispatch) {
       if (!finalText) {
         const summary = 'OpenClaw returned no structured response frame; no customer content produced.'
         await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-        await postJson(state, '/api/helm-link/connector/ack', {
+        await acknowledgeTerminal(state, dispatch, {
           protocolVersion: PROTOCOL,
           dispatchId: dispatch.id,
           state: 'failed',
           terminalCode: 'openclaw_unstructured',
           terminalSummary: summary,
-        })
+        }, liveness)
       } else {
         // OpenClaw 2026.7.1 emits one JSON envelope at process completion,
         // not NDJSON streaming frames. Emit one bounded structured delta so
@@ -461,14 +525,14 @@ async function handleDispatch(state, dispatch) {
         await postConnectorEvent(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
         await postConnectorEvent(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
         // HFA-004 — exact locked recovery transcript literal.
-        await postJson(state, '/api/helm-link/connector/ack', { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' })
+        await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' }, liveness)
       }
     }
   } finally {
     invocation.cleanup()
+    liveness.activeDispatchId = null
+    liveness.activeDispatchStartedAt = null
   }
-  state.processedDispatchIds = [dispatch.id, ...state.processedDispatchIds.filter((id) => id !== dispatch.id)].slice(0, LEDGER_MAX)
-  saveState(state)
 }
 
 export async function runOpenClawAdvisory({
@@ -685,24 +749,36 @@ function sanitizeCustomerText(value, limit) {
 async function runLoop() {
   const state = loadState()
   if (!state) throw new Error('No connector state. Run connect first.')
+  const liveness = {
+    lastPollCompletedAt: 0,
+    pollStartedAt: 0,
+    lastDispatchProgressAt: 0,
+    activeDispatchId: null,
+    activeDispatchStartedAt: null,
+  }
   let presenceTimer = null
   for (;;) {
     try {
       if (!presenceTimer) {
-        await presence(state, 'online')
+        await presence(state, liveness, 'connecting')
         let presenceInFlight = false
         presenceTimer = setInterval(() => {
           if (presenceInFlight) return
           presenceInFlight = true
-          void presence(state, 'online')
+          void presence(state, liveness)
             .catch((error) => console.error(`[helm-link] presence heartbeat failed: ${error.message}`))
             .finally(() => { presenceInFlight = false })
         }, 30_000)
       }
+      await flushPendingAcks(state, liveness)
+      liveness.pollStartedAt = Date.now()
       const body = await postJson(state, '/api/helm-link/connector/poll', { protocolVersion: PROTOCOL })
-      if (body.dispatch) await handleDispatch(state, body.dispatch)
+      liveness.pollStartedAt = 0
+      liveness.lastPollCompletedAt = Date.now()
+      if (body.dispatch) await handleDispatch(state, body.dispatch, liveness)
       else await sleep(body.retryAfterMs || 5000)
     } catch (error) {
+      liveness.pollStartedAt = 0
       if (error.status === 403 || error.status === 410 || /revoked/i.test(error.message)) {
         state.status = 'revoked'
         state.revokedAt = new Date().toISOString()

@@ -40,21 +40,21 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/package-helm-link-connector.mjs --out-dir /tmp/helm-link-publish
-          archive=/tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.5.tgz
+          archive=/tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.6.tgz
           test "$(find /tmp/helm-link-publish -maxdepth 1 -name '*.tgz' | wc -l | tr -d ' ')" = 1
           test "$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_SHA256"
           (cd /tmp/helm-link-publish && sha256sum --check SHA256SUMS)
       - name: Publish public package with npm provenance
-        run: npm publish /tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.5.tgz --access public --tag latest --provenance
+        run: npm publish /tmp/helm-link-publish/pharos-hq-helm-link-connector-0.1.6.tgz --access public --tag latest --provenance
       - name: Verify registry integrity, tags, and attestation receipt
         shell: bash
         run: |
           set -euo pipefail
           for attempt in $(seq 1 12); do
-            version="$(npm view '@pharos-hq/helm-link-connector@0.1.5' version 2>/dev/null || true)"
-            if [[ "$version" = '0.1.5' ]]; then break; fi
+            version="$(npm view '@pharos-hq/helm-link-connector@0.1.6' version 2>/dev/null || true)"
+            if [[ "$version" = '0.1.6' ]]; then break; fi
             sleep 5
           done
-          test "$version" = '0.1.5'
-          test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.1.5'
-          npm view '@pharos-hq/helm-link-connector@0.1.5' dist.integrity dist.shasum dist.attestations --json
+          test "$version" = '0.1.6'
+          test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.1.6'
+          npm view '@pharos-hq/helm-link-connector@0.1.6' dist.integrity dist.shasum dist.attestations --json
