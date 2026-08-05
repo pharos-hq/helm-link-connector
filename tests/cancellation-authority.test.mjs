@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import {
   classifyCancellationTerminal,
   requestGatewayCancellation,
+  runConnectorLoops,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
 import { readTerminalRecord, recordTerminal } from '../packages/helm-link-connector/lib/terminal-store.mjs'
 
@@ -79,3 +80,66 @@ try {
 }
 
 console.log('VERIFIED cancellation intent precedes Gateway await and all races use one absorbing terminal path')
+
+// Exact staging regression: the dispatch is claimed, ordinary request budget
+// is exhausted, but the independently governed cancellation control path still
+// reaches Gateway and produces the absorbing pre-provider terminal decision.
+{
+  const controller = new AbortController()
+  let ordinaryCalls = 0
+  let ordinaryRateLimits = 0
+  let controlCalls = 0
+  let cancelCalls = 0
+  let terminalCode = null
+  const observedDispatchId = 'run-rate-starvation-regression'
+  const loopState = { ...state, fencingToken: 1 }
+  await runConnectorLoops(loopState, {
+    signal: controller.signal,
+    idlePollMs: 1,
+    busyCheckMs: 1,
+    presenceMs: 1,
+    telemetryMs: 1,
+    cancellationMs: 1,
+    sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 2))),
+    postImpl: async (_state, pathname) => {
+      ordinaryCalls += 1
+      if (pathname === '/api/helm-link/connector/poll' && ordinaryCalls === 1) {
+        return { dispatch: { id: observedDispatchId }, queueDepth: 1 }
+      }
+      ordinaryRateLimits += 1
+      const error = new Error('Connector rate limit exceeded.')
+      error.status = 429
+      throw error
+    },
+    controlPostImpl: async (_state, pathname, body) => {
+      controlCalls += 1
+      assert.equal(pathname, '/api/helm-link/connector/cancellations')
+      assert.equal(body.dispatchId, observedDispatchId)
+      return { cancellation: { requestedAt: '2026-08-05T20:24:00Z' } }
+    },
+    cancelImpl: async (_state, runId) => {
+      cancelCalls += 1
+      assert.equal(runId, observedDispatchId)
+      return { cancelled: true, providerStarted: false }
+    },
+    handleImpl: async (_state, dispatch, active) => {
+      active.activeDispatchId = dispatch.id
+      active.activeGatewayRunId = dispatch.id
+      const deadline = Date.now() + 1_000
+      while (!active.cancellation?.resolved && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2))
+      }
+      assert.equal(active.cancellation?.cancelled, true)
+      terminalCode = classifyCancellationTerminal(active.cancellation).terminalCode
+      controller.abort()
+    },
+    presenceImpl: async () => {},
+    telemetryImpl: async () => ({ runtimeState: 'unknown' }),
+  })
+  assert.ok(ordinaryRateLimits > 0, 'ordinary request budget must be exhausted')
+  assert.ok(controlCalls > 0, 'reserved cancellation control path must remain available')
+  assert.equal(cancelCalls, 1)
+  assert.equal(terminalCode, 'cancelled_before_provider')
+}
+
+console.log('VERIFIED claim -> durable cancellation -> ordinary 429 -> reserved delivery -> absorbing terminal')

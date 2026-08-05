@@ -259,6 +259,14 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
   return json
 }
 
+// Cancellation is durable control traffic. Keep the call site distinct from
+// ordinary acquisition/presence/event traffic so the server can reserve an
+// independently governed budget for it. The server derives the traffic class
+// from the authenticated route; callers cannot promote arbitrary requests.
+export async function postControlJson(state, pathname, body, options = {}) {
+  return postJson(state, pathname, body, options)
+}
+
 async function doctor(args) {
   const checks = []
   checks.push({ name: 'node_22_plus', ok: Number(process.versions.node.split('.')[0]) >= 22, detail: process.version })
@@ -1022,6 +1030,7 @@ async function runLoop() {
 
 export async function runConnectorLoops(state, options = {}) {
   const postImpl = options.postImpl || postJson
+  const controlPostImpl = options.controlPostImpl || postControlJson
   const handleImpl = options.handleImpl || handleDispatch
   const presenceImpl = options.presenceImpl || presence
   const telemetryImpl = options.telemetryImpl || collectTelemetry
@@ -1100,7 +1109,7 @@ export async function runConnectorLoops(state, options = {}) {
     while (!stopped()) {
       try {
         if (liveness.activeDispatchId) {
-          const body = await postImpl(state, '/api/helm-link/connector/cancellations', {
+          const body = await controlPostImpl(state, '/api/helm-link/connector/cancellations', {
             protocolVersion: PROTOCOL,
             dispatchId: liveness.activeDispatchId,
           })
@@ -1110,7 +1119,9 @@ export async function runConnectorLoops(state, options = {}) {
             // child may terminate first; that race must enter the same absorbing
             // terminal path as a completed cancel response, never the generic
             // process-failure path.
-            await requestGatewayCancellation(state, liveness, body.cancellation.requestedAt)
+            await requestGatewayCancellation(state, liveness, body.cancellation.requestedAt, {
+              cancelImpl: options.cancelImpl || cancelGatewayAgentRun,
+            })
           }
         } else lastRequestedAt = null
       } catch (error) { console.error(`[helm-link] cancellation check failed: ${error.message}`) }
