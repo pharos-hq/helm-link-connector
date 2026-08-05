@@ -108,10 +108,25 @@ await assert.rejects(
   }),
   (error) => error?.code === 'helm_link_request_timeout',
 )
+await assert.rejects(
+  postJson({
+    server: 'https://example.invalid',
+    bindingId: '00000000-0000-4000-8000-000000000001',
+    privateKeyPem: pair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+  }, '/stalled-body', {}, {
+    timeoutMs: 20,
+    fetchImpl: (_url, { signal }) => Promise.resolve({
+      text: () => new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      }),
+    }),
+  }),
+  (error) => error?.code === 'helm_link_request_timeout',
+)
 
 console.log('VERIFIED OpenClaw 2026.7.1 structured-output contract')
 console.log('VERIFIED malformed, non-zero, timeout, and zero-content fail closed')
-console.log('VERIFIED bounded HTTP requests and data-plane-derived presence')
+console.log('VERIFIED bounded HTTP headers/body and data-plane-derived presence')
 
 async function runScenario(scenario, timeoutMs = 2000) {
   return runOpenClawAdvisory({

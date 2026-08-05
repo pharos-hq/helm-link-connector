@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.1.8'
+const VERSION = '0.1.9'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const SERVICE_LABEL = 'com.pharos.helm-link'
@@ -181,6 +181,7 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   let res
+  let text
   try {
     res = await fetchImpl(new URL(pathname, state.server).toString(), {
       method: 'POST',
@@ -195,6 +196,9 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
       body: raw,
       signal: controller.signal,
     })
+    // Keep the same deadline active through body consumption. fetch()
+    // resolves at headers; a stalled body must not wedge the poll loop.
+    text = await res.text()
   } catch (error) {
     if (controller.signal.aborted) {
       const timeoutError = new Error(`Connector request timed out after ${timeoutMs}ms: ${pathname}`)
@@ -205,7 +209,6 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
   } finally {
     clearTimeout(timer)
   }
-  const text = await res.text()
   const json = text ? JSON.parse(text) : {}
   if (!res.ok) {
     const error = new Error(json.error || `HTTP ${res.status}`)
