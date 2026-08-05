@@ -168,15 +168,21 @@ export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false
   }
 }
 
-export function operationalArgs(agentId, bindingId, dispatchId, text, contract) {
+export function operationalArgs(agentId, bindingId, dispatchId, text, contract, expiresAt) {
   const run = validateRunContract(contract)
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-run-'))
   const file = join(dir, 'message.txt')
   writePrivate(file, text)
+  const parsedExpiry = Date.parse(expiresAt)
+  const queueDeadlineAt = Number.isFinite(parsedExpiry) ? parsedExpiry : Date.now()
+  const queueRemainingMs = Math.max(0, queueDeadlineAt - Date.now())
   return {
-    args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-run:${bindingId}:${dispatchId}`, '--message-file', file, '--timeout', String(Math.ceil(run.deadlineMs / 1000)), '--json'],
-    timeoutMs: run.deadlineMs + 5_000,
+    args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-run:${bindingId}:${dispatchId}`,
+      '--run-id', dispatchId, '--queue-deadline-at', String(queueDeadlineAt),
+      '--execution-timeout-ms', String(run.deadlineMs), '--message-file', file,
+      '--timeout', String(Math.ceil((run.deadlineMs + queueRemainingMs) / 1000)), '--json'],
+    timeoutMs: run.deadlineMs + queueRemainingMs + 5_000,
     cleanup() {
       try { unlinkSync(file) } catch {}
       try { rmSync(dir, { recursive: true, force: true }) } catch {}
@@ -589,10 +595,12 @@ async function handleDispatch(state, dispatch, liveness) {
   const text = String(dispatch.payload?.text || '')
   const lane = dispatch.payload?.kind === 'run' ? 'run' : 'chat'
   const invocation = lane === 'run'
-    ? operationalArgs(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract)
+    ? operationalArgs(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt)
     : advisoryArgs(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
   state.activeInvocationId = invocationId
   liveness.activeDispatchId = dispatch.id
+  liveness.activeGatewayRunId = dispatch.id
+  liveness.cancellation = null
   liveness.activeDispatchStartedAt = Date.now()
   try {
     journal('dispatch_received', { dispatchId: dispatch.id, bindingId: state.bindingId })
@@ -615,6 +623,22 @@ async function handleDispatch(state, dispatch, liveness) {
       }),
     })
     if (result.terminationCause !== 'completed') {
+      if (liveness.cancellation) {
+        const providerStarted = liveness.cancellation.providerStarted === true
+        const confirmed = liveness.cancellation.cancelled === true
+        const terminalCode = confirmed
+          ? providerStarted ? 'cancelled_during_execution' : 'cancelled_before_provider'
+          : 'execution_outcome_unknown'
+        const summary = confirmed
+          ? providerStarted
+            ? 'Run cancellation was confirmed after provider execution began.'
+            : 'Run cancellation was confirmed before provider execution began.'
+          : 'Cancellation raced a Gateway interruption; execution outcome is unknown and replay is forbidden.'
+        await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
+        await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
+          state: 'failed', terminalCode, terminalSummary: summary }, liveness)
+        return
+      }
       const terminalByCause = {
         parent_timeout: ['openclaw_parent_timeout', 'OpenClaw advisory exceeded its parent deadline; no customer content produced.'],
         stdout_overflow: ['openclaw_stdout_overflow', 'OpenClaw stdout exceeded its bound; no customer content produced.'],
@@ -655,6 +679,8 @@ async function handleDispatch(state, dispatch, liveness) {
   } finally {
     await runBoundedCleanup(invocation.cleanup)
     liveness.activeDispatchId = null
+    liveness.activeGatewayRunId = null
+    liveness.cancellation = null
     liveness.activeDispatchStartedAt = null
     delete state.activeInvocationId
   }
@@ -1001,9 +1027,11 @@ export async function runConnectorLoops(state, options = {}) {
   const presenceMs = options.presenceMs ?? 30_000
   const telemetryMs = options.telemetryMs ?? 30_000
   const telemetryTimeoutMs = options.telemetryTimeoutMs ?? 40_000
+  const cancellationMs = options.cancellationMs ?? 250
   const liveness = {
     lastPollCompletedAt: 0, pollStartedAt: 0, lastDispatchProgressAt: 0,
-    activeDispatchId: null, activeDispatchStartedAt: null, queueDepth: 0,
+    activeDispatchId: null, activeGatewayRunId: null, activeDispatchStartedAt: null,
+    cancellation: null, queueDepth: 0,
   }
   const queue = []
   const telemetry = { openclawVersion: null, runtimeModel: null, updatedAt: null }
@@ -1019,6 +1047,7 @@ export async function runConnectorLoops(state, options = {}) {
         const body = await postImpl(state, '/api/helm-link/connector/poll', {
           protocolVersion: PROTOCOL,
           localCapacity,
+          admissionContract: 'openclaw-agent-lane-v1',
           runtimeState: telemetry.runtimeState || 'unknown',
           runtimeStateObservedAt: telemetry.updatedAt,
         })
@@ -1061,7 +1090,45 @@ export async function runConnectorLoops(state, options = {}) {
       await pause(telemetryMs)
     }
   }
-  await Promise.all([acquisitionLoop(), executionLoop(), presenceLoop(), telemetryLoop()])
+  const cancellationLoop = async () => {
+    let lastRequestedAt = null
+    while (!stopped()) {
+      try {
+        if (liveness.activeDispatchId) {
+          const body = await postImpl(state, '/api/helm-link/connector/cancellations', {
+            protocolVersion: PROTOCOL,
+            dispatchId: liveness.activeDispatchId,
+          })
+          if (body.cancellation?.requestedAt && body.cancellation.requestedAt !== lastRequestedAt) {
+            lastRequestedAt = body.cancellation.requestedAt
+            liveness.cancellation = await cancelGatewayAgentRun(state, liveness.activeGatewayRunId)
+          }
+        } else lastRequestedAt = null
+      } catch (error) { console.error(`[helm-link] cancellation check failed: ${error.message}`) }
+      await pause(cancellationMs)
+    }
+  }
+  await Promise.all([acquisitionLoop(), executionLoop(), presenceLoop(), telemetryLoop(), cancellationLoop()])
+}
+
+export async function cancelGatewayAgentRun(state, runId, { runImpl = runOpenClawAdvisory } = {}) {
+  const result = await runImpl({
+    args: ['gateway', 'call', 'agent.cancel', '--params', JSON.stringify({
+      runId,
+      agentId: state.runtimeAgentId,
+      sessionKey: `agent:${state.runtimeAgentId}:helm-run:${state.bindingId}:${runId}`,
+    }), '--json', '--timeout', '5000'],
+    timeoutMs: 7_000,
+    outputLimit: 50_000,
+    stderrLimit: 25_000,
+  })
+  if (result.terminationCause !== 'completed') return { cancelled: false, providerStarted: null }
+  try {
+    const parsed = JSON.parse(result.stdout)
+    return parsed?.payload ?? parsed?.result ?? parsed
+  } catch {
+    return { cancelled: false, providerStarted: null }
+  }
 }
 
 async function collectTelemetry(state) {

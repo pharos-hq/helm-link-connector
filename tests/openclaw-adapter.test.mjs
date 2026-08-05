@@ -8,6 +8,8 @@ import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import {
   advisoryArgs,
+  operationalArgs,
+  cancelGatewayAgentRun,
   extractStructuredModel,
   extractStructuredText,
   buildLaunchdPlist,
@@ -45,6 +47,28 @@ try {
 } finally {
   invocation.cleanup()
 }
+
+const operational = operationalArgs('fixture-agent', 'binding-123',
+  '00000000-0000-4000-8000-000000000099', 'durable work', {
+    kind: 'run', capabilities: ['research'], deadlineMs: 30_000,
+    progress: 'durable-events', cancellation: 'terminal-no-replay', output: 'durable-terminal',
+  }, new Date(Date.now() + 60_000).toISOString())
+try {
+  assert.deepEqual(operational.args.slice(operational.args.indexOf('--run-id'), operational.args.indexOf('--run-id') + 2),
+    ['--run-id', '00000000-0000-4000-8000-000000000099'])
+  assert.ok(operational.args.includes('--queue-deadline-at'))
+  assert.ok(operational.args.includes('--execution-timeout-ms'))
+} finally { operational.cleanup() }
+
+const cancelResult = await cancelGatewayAgentRun({ runtimeAgentId: 'fixture-agent', bindingId: 'binding-123' },
+  '00000000-0000-4000-8000-000000000099', {
+    runImpl: async ({ args }) => {
+      assert.equal(args[2], 'agent.cancel')
+      assert.match(args[4], /00000000-0000-4000-8000-000000000099/)
+      return { terminationCause: 'completed', stdout: JSON.stringify({ cancelled: true, providerStarted: false }) }
+    },
+  })
+assert.deepEqual(cancelResult, { cancelled: true, providerStarted: false })
 
 const actualEnvelope = JSON.stringify({
   runId: '00000000-0000-4000-8000-000000000001',
