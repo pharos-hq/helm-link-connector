@@ -993,11 +993,17 @@ export async function runConnectorLoops(state, options = {}) {
 
   const acquisitionLoop = async () => {
     while (!stopped()) {
-      if (executing || queue.length) { await pause(busyCheckMs); continue }
       try {
+        const localCapacity = executing || queue.length ? 0 : 1
         liveness.pollStartedAt = Date.now()
-        const body = await postImpl(state, '/api/helm-link/connector/poll', { protocolVersion: PROTOCOL })
+        const body = await postImpl(state, '/api/helm-link/connector/poll', {
+          protocolVersion: PROTOCOL,
+          localCapacity,
+          runtimeState: telemetry.updatedAt ? 'free' : 'unknown',
+          runtimeStateObservedAt: telemetry.updatedAt,
+        })
         liveness.lastPollCompletedAt = Date.now()
+        if (body.dispatch && localCapacity === 0) throw new Error('Server dispatched work at zero local capacity.')
         if (body.dispatch) queue.push(body.dispatch)
         else await pause(body.retryAfterMs ?? idlePollMs)
       } catch (error) {
