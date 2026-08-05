@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { performance } from 'node:perf_hooks'
 import { createLifecycleJournal } from '../lib/lifecycle-journal.mjs'
+import { claimInvocation } from '../lib/invocation-claims.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
 const VERSION = '0.1.9'
@@ -495,9 +496,17 @@ async function handleDispatch(state, dispatch, liveness) {
     await flushPendingAcks(state, liveness)
     return
   }
+  const journal = createLifecycleJournal(LIFECYCLE_FILE)
+  const invocationId = randomUUID()
+  const claim = claimInvocation(STATE_DIR, {
+    dispatchId: dispatch.id,
+    bindingId: state.bindingId,
+    fencingToken: Number(state.fencingToken || 0),
+    invocationId,
+  })
+  journal('invocation_claimed', claim)
   const text = dispatch.payload?.text
   const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
-  const journal = createLifecycleJournal(LIFECYCLE_FILE)
   liveness.activeDispatchId = dispatch.id
   liveness.activeDispatchStartedAt = Date.now()
   try {
