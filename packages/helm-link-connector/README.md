@@ -11,7 +11,7 @@ code, or paste or screenshot the command. Version `0.1.9` is eligible for
 publication only through the repository's tag-bound GitHub OIDC workflow with
 npm provenance.
 
-The `0.2.0-architecture.0` source is an unpublished review candidate. It is
+The `0.2.0-architecture.1` source is an unpublished review candidate. It is
 intentionally absent from the tag-bound publication workflow and must not be
 installed on a live binding before a separate staging release gate.
 

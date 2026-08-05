@@ -28,7 +28,7 @@ writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ status: 'paired' })
 const first = installService({ platformName: 'darwin' })
 const second = installService({ platformName: 'darwin' })
 assert.equal(first.installed, true)
-assert.equal(second.version, '0.2.0-architecture.0')
+assert.equal(second.version, '0.2.0-architecture.1')
 
 const plist = readFileSync(first.plist, 'utf8')
 assert.match(plist, /<key>RunAtLoad<\/key><true\/>/)

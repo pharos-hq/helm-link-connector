@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.0-architecture.0'
+const VERSION = '0.2.0-architecture.1'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
