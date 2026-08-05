@@ -12,11 +12,14 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { homedir, platform, release, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { performance } from 'node:perf_hooks'
+import { createLifecycleJournal } from '../lib/lifecycle-journal.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
 const VERSION = '0.1.9'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
+const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
 const SERVICE_LABEL = 'com.pharos.helm-link'
 const LEDGER_MAX = 200
 const HTTP_REQUEST_TIMEOUT_MS = 20_000
@@ -494,12 +497,21 @@ async function handleDispatch(state, dispatch, liveness) {
   }
   const text = dispatch.payload?.text
   const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
+  const journal = createLifecycleJournal(LIFECYCLE_FILE)
   liveness.activeDispatchId = dispatch.id
   liveness.activeDispatchStartedAt = Date.now()
   try {
+    journal('dispatch_received', { dispatchId: dispatch.id, bindingId: state.bindingId })
     await postConnectorEvent(state, statusEvent(state, dispatch, 'working'))
     liveness.lastDispatchProgressAt = Date.now()
-    const result = await runOpenClawAdvisory({ args: invocation.args })
+    const result = await runOpenClawAdvisory({
+      args: invocation.args,
+      lifecycle: (kind, fields) => journal(kind, {
+        dispatchId: dispatch.id,
+        bindingId: state.bindingId,
+        ...fields,
+      }),
+    })
     if (result.timedOut) {
       const summary = 'OpenClaw advisory timed out; no customer content produced.'
       await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
@@ -545,40 +557,107 @@ export async function runOpenClawAdvisory({
   binary = resolveOpenClaw(),
   timeoutMs = 125000,
   env = process.env,
+  lifecycle = () => {},
+  outputLimit = 1_000_000,
 } = {}) {
   if (!Array.isArray(args)) throw new Error('OpenClaw advisory args are required.')
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, {
-      env: { ...env, NO_COLOR: '1' },
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    let stdout = ''
-    let timedOut = false
-    let overflow = false
-    const outputLimit = 1_000_000
-    const appendBounded = (current, chunk) => {
-      const next = current + chunk.toString()
-      if (Buffer.byteLength(next, 'utf8') <= outputLimit) return next
-      overflow = true
-      child.kill('SIGTERM')
-      return current
+    const startedMonotonicMs = performance.now()
+    const startedAt = new Date().toISOString()
+    let child
+    try {
+      child = spawn(binary, args, {
+        env: { ...env, NO_COLOR: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      lifecycle('spawn_error', { errorCode: error?.code || null })
+      reject(error)
+      return
     }
-    child.stdout.on('data', (chunk) => { stdout = appendBounded(stdout, chunk) })
+    let stdout = ''
+    let stderr = ''
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let firstStdoutAt = null
+    let firstStderrAt = null
+    let timedOut = false
+    let stdoutTruncated = false
+    let stderrTruncated = false
+    lifecycle('spawned', { pid: child.pid || null, startedAt })
+    const appendBounded = (stream, current, chunk) => {
+      const bytes = Buffer.byteLength(chunk)
+      if (stream === 'stdout') {
+        stdoutBytes += bytes
+        if (!firstStdoutAt) firstStdoutAt = new Date().toISOString()
+      } else {
+        stderrBytes += bytes
+        if (!firstStderrAt) firstStderrAt = new Date().toISOString()
+      }
+      const retainedBytes = Buffer.byteLength(current, 'utf8')
+      const remaining = Math.max(0, outputLimit - retainedBytes)
+      if (bytes <= remaining) return current + chunk.toString()
+      if (stream === 'stdout') stdoutTruncated = true
+      else stderrTruncated = true
+      child.kill('SIGTERM')
+      return current + chunk.subarray(0, remaining).toString()
+    }
+    child.stdout.on('data', (chunk) => { stdout = appendBounded('stdout', stdout, chunk) })
+    child.stderr.on('data', (chunk) => { stderr = appendBounded('stderr', stderr, chunk) })
     child.once('error', reject)
     let forceTimer = null
     const timer = setTimeout(() => {
       timedOut = true
+      lifecycle('signal_sent', { signal: 'SIGTERM', timerIdentity: 'runtime_deadline' })
       child.kill('SIGTERM')
-      forceTimer = setTimeout(() => child.kill('SIGKILL'), 2000)
+      forceTimer = setTimeout(() => {
+        lifecycle('signal_sent', { signal: 'SIGKILL', timerIdentity: 'sigterm_grace' })
+        child.kill('SIGKILL')
+      }, 2000)
       forceTimer.unref?.()
     }, timeoutMs)
     timer.unref?.()
     child.once('close', (code, signal) => {
       clearTimeout(timer)
       if (forceTimer) clearTimeout(forceTimer)
-      resolve({ code: code ?? 1, signal, timedOut, overflow, stdout })
+      const terminationCause = timedOut
+        ? 'parent_timeout'
+        : stdoutTruncated
+          ? 'stdout_overflow'
+          : stderrTruncated
+            ? 'stderr_overflow'
+            : signal
+              ? 'signal_exit'
+              : code === 0
+                ? 'completed'
+                : 'nonzero_exit'
+      const diagnostics = {
+        code: code ?? 1,
+        signal,
+        timedOut,
+        overflow: stdoutTruncated || stderrTruncated,
+        stdout,
+        stderr,
+        stdoutBytes,
+        stderrBytes,
+        stdoutTruncated,
+        stderrTruncated,
+        firstStdoutAt,
+        firstStderrAt,
+        startedAt,
+        durationMs: Number((performance.now() - startedMonotonicMs).toFixed(3)),
+        timerIdentity: timedOut ? 'runtime_deadline' : null,
+        terminationCause,
+      }
+      lifecycle('child_closed', diagnosticsWithoutContent(diagnostics))
+      resolve(diagnostics)
     })
   })
+}
+
+function diagnosticsWithoutContent(result) {
+  const { stdout: _stdout, stderr: _stderr, ...diagnostics } = result
+  return diagnostics
 }
 
 function baseEvent(state, dispatch, kind, body) {

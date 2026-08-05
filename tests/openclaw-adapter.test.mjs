@@ -61,6 +61,11 @@ assert.equal(structured.code, 0)
 assert.equal(structured.timedOut, false)
 assert.equal(extractStructuredText(structured.stdout), 'structured customer response')
 assert.equal(extractStructuredModel(structured.stdout), 'openai/gpt-fixture')
+assert.equal(structured.terminationCause, 'completed')
+assert.equal(structured.stdoutBytes, Buffer.byteLength(structured.stdout))
+assert.equal(structured.stderrBytes, 0)
+assert.equal(structured.stdoutTruncated, false)
+assert.equal(structured.stderrTruncated, false)
 
 const malformed = await runScenario('malformed')
 assert.equal(malformed.code, 0)
@@ -72,6 +77,7 @@ assert.equal(extractStructuredText(nonzero.stdout), '')
 
 const timedOut = await runScenario('timeout', 50)
 assert.equal(timedOut.timedOut, true)
+assert.equal(timedOut.terminationCause, 'parent_timeout')
 assert.equal(extractStructuredText(timedOut.stdout), '')
 
 const zeroContent = await runScenario('zero-content')
@@ -127,6 +133,7 @@ await assert.rejects(
 console.log('VERIFIED OpenClaw 2026.7.1 structured-output contract')
 console.log('VERIFIED malformed, non-zero, timeout, and zero-content fail closed')
 console.log('VERIFIED bounded HTTP headers/body and data-plane-derived presence')
+console.log('VERIFIED typed termination diagnostics and independent stdout/stderr counters')
 
 async function runScenario(scenario, timeoutMs = 2000) {
   return runOpenClawAdvisory({
