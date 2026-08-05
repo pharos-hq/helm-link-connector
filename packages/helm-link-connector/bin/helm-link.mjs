@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.1.7'
+const VERSION = '0.1.8'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const SERVICE_LABEL = 'com.pharos.helm-link'
@@ -427,7 +427,9 @@ function serviceStatus() {
 }
 
 export function deriveLivenessPresence(liveness, nowMs = Date.now()) {
-  if (!liveness.lastPollCompletedAt) return 'connecting'
+  // Existing Helm schemas admit degraded but not the transitional
+  // connecting value. Fail closed until the first successful poll.
+  if (!liveness.lastPollCompletedAt) return 'degraded'
   const latestProgress = Math.max(
     liveness.lastPollCompletedAt || 0,
     liveness.lastDispatchProgressAt || 0,
@@ -760,7 +762,7 @@ async function runLoop() {
   for (;;) {
     try {
       if (!presenceTimer) {
-        await presence(state, liveness, 'connecting')
+        await presence(state, liveness)
         let presenceInFlight = false
         presenceTimer = setInterval(() => {
           if (presenceInFlight) return

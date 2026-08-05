@@ -82,7 +82,7 @@ assert.ok(!extractStructuredText(zeroContent.stdout).includes('must not escape')
 assert.equal(extractStructuredText('{"status":"ok","result":{"payloads":"not-an-array"}}'), '')
 assert.equal(extractStructuredText('raw stdout that resembles customer content'), '')
 
-assert.equal(deriveLivenessPresence({ lastPollCompletedAt: 0 }), 'connecting')
+assert.equal(deriveLivenessPresence({ lastPollCompletedAt: 0 }), 'degraded')
 assert.equal(deriveLivenessPresence({
   lastPollCompletedAt: 100_000,
   lastDispatchProgressAt: 0,
