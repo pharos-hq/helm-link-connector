@@ -570,14 +570,19 @@ async function handleDispatch(state, dispatch, liveness) {
         startedAt,
       }),
     })
-    if (result.timedOut) {
-      const summary = 'OpenClaw advisory timed out; no customer content produced.'
+    if (result.terminationCause !== 'completed') {
+      const terminalByCause = {
+        parent_timeout: ['openclaw_parent_timeout', 'OpenClaw advisory exceeded its parent deadline; no customer content produced.'],
+        stdout_overflow: ['openclaw_stdout_overflow', 'OpenClaw stdout exceeded its bound; no customer content produced.'],
+        stderr_overflow: ['openclaw_stderr_overflow', 'OpenClaw stderr exceeded its bound; no customer content produced.'],
+        signal_exit: ['openclaw_signal_exit', 'OpenClaw exited by signal; no customer content produced.'],
+        nonzero_exit: ['openclaw_nonzero_exit', 'OpenClaw exited nonzero; no customer content produced.'],
+        spawn_error: ['openclaw_spawn_error', 'OpenClaw could not be spawned; no customer content produced.'],
+        close_timeout: ['openclaw_close_timeout', 'OpenClaw did not close within its external bound; no customer content produced.'],
+      }
+      const [terminalCode, summary] = terminalByCause[result.terminationCause] || ['openclaw_failed', 'OpenClaw advisory failed; no customer content produced.']
       await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_timeout', terminalSummary: summary }, liveness)
-    } else if (result.code !== 0 || result.overflow) {
-      const summary = 'OpenClaw advisory failed; no customer content produced.'
-      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_failed', terminalSummary: summary }, liveness)
+      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode, terminalSummary: summary }, liveness)
     } else {
       // HFA-004 — extractText requires structured output; if OpenClaw
       // produced no parseable response frame the run is treated as a
@@ -604,7 +609,7 @@ async function handleDispatch(state, dispatch, liveness) {
       }
     }
   } finally {
-    invocation.cleanup()
+    await runBoundedCleanup(invocation.cleanup)
     liveness.activeDispatchId = null
     liveness.activeDispatchStartedAt = null
     delete state.activeInvocationId
@@ -628,6 +633,10 @@ export async function runOpenClawAdvisory({
   lifecycle = () => {},
   onSpawn = () => {},
   outputLimit = 1_000_000,
+  stderrLimit = 250_000,
+  sigtermGraceMs = 2_000,
+  closeTimeoutMs = 2_000,
+  spawnImpl = spawn,
 } = {}) {
   if (!Array.isArray(args)) throw new Error('OpenClaw advisory args are required.')
   return new Promise((resolve, reject) => {
@@ -635,7 +644,7 @@ export async function runOpenClawAdvisory({
     const startedAt = new Date().toISOString()
     let child
     try {
-      child = spawn(binary, args, {
+      child = spawnImpl(binary, args, {
         env: { ...env, NO_COLOR: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
       })
@@ -653,6 +662,12 @@ export async function runOpenClawAdvisory({
     let timedOut = false
     let stdoutTruncated = false
     let stderrTruncated = false
+    let terminationCause = null
+    let timerIdentity = null
+    let settled = false
+    let runtimeTimer = null
+    let forceTimer = null
+    let closeTimer = null
     lifecycle('spawned', { pid: child.pid || null, startedAt })
     try {
       onSpawn({ pid: child.pid || null, startedAt })
@@ -673,64 +688,77 @@ export async function runOpenClawAdvisory({
         if (!firstStderrAt) firstStderrAt = new Date().toISOString()
       }
       const retainedBytes = Buffer.byteLength(current, 'utf8')
-      const remaining = Math.max(0, outputLimit - retainedBytes)
+      const limit = stream === 'stdout' ? outputLimit : stderrLimit
+      const remaining = Math.max(0, limit - retainedBytes)
       if (bytes <= remaining) return current + chunk.toString()
       if (stream === 'stdout') stdoutTruncated = true
       else stderrTruncated = true
-      child.kill('SIGTERM')
+      terminate(stream === 'stdout' ? 'stdout_overflow' : 'stderr_overflow', `${stream}_limit`)
       return current + chunk.subarray(0, remaining).toString()
     }
     child.stdout.on('data', (chunk) => { stdout = appendBounded('stdout', stdout, chunk) })
     child.stderr.on('data', (chunk) => { stderr = appendBounded('stderr', stderr, chunk) })
-    child.once('error', reject)
-    let forceTimer = null
-    const timer = setTimeout(() => {
-      timedOut = true
-      lifecycle('signal_sent', { signal: 'SIGTERM', timerIdentity: 'runtime_deadline' })
+    const diagnostics = (code, signal, cause = terminationCause) => ({
+      code: code ?? (cause === 'completed' ? 0 : 1), signal, timedOut,
+      overflow: stdoutTruncated || stderrTruncated, stdout, stderr, stdoutBytes, stderrBytes,
+      stdoutTruncated, stderrTruncated, firstStdoutAt, firstStderrAt, startedAt,
+      durationMs: Number((performance.now() - startedMonotonicMs).toFixed(3)),
+      timerIdentity, terminationCause: cause,
+    })
+    const settle = (code, signal, cause = terminationCause) => {
+      if (settled) return
+      settled = true
+      clearTimeout(runtimeTimer)
+      clearTimeout(forceTimer)
+      clearTimeout(closeTimer)
+      const result = diagnostics(code, signal, cause)
+      lifecycle('child_closed', diagnosticsWithoutContent(result))
+      resolve(result)
+    }
+    const terminate = (cause, timer) => {
+      if (terminationCause) return
+      terminationCause = cause
+      timerIdentity = timer
+      lifecycle('signal_sent', { signal: 'SIGTERM', timerIdentity: timer })
       child.kill('SIGTERM')
       forceTimer = setTimeout(() => {
         lifecycle('signal_sent', { signal: 'SIGKILL', timerIdentity: 'sigterm_grace' })
         child.kill('SIGKILL')
-      }, 2000)
-      forceTimer.unref?.()
+      }, sigtermGraceMs)
+      closeTimer = setTimeout(() => settle(null, null, 'close_timeout'), sigtermGraceMs + closeTimeoutMs)
+    }
+    child.once('error', (error) => {
+      lifecycle('spawn_error', { errorCode: error?.code || null })
+      terminationCause = 'spawn_error'
+      settle(null, null, 'spawn_error')
+    })
+    runtimeTimer = setTimeout(() => {
+      timedOut = true
+      terminate('parent_timeout', 'runtime_deadline')
     }, timeoutMs)
-    timer.unref?.()
     child.once('close', (code, signal) => {
-      clearTimeout(timer)
-      if (forceTimer) clearTimeout(forceTimer)
-      const terminationCause = timedOut
-        ? 'parent_timeout'
-        : stdoutTruncated
-          ? 'stdout_overflow'
-          : stderrTruncated
-            ? 'stderr_overflow'
-            : signal
-              ? 'signal_exit'
-              : code === 0
-                ? 'completed'
-                : 'nonzero_exit'
-      const diagnostics = {
-        code: code ?? 1,
-        signal,
-        timedOut,
-        overflow: stdoutTruncated || stderrTruncated,
-        stdout,
-        stderr,
-        stdoutBytes,
-        stderrBytes,
-        stdoutTruncated,
-        stderrTruncated,
-        firstStdoutAt,
-        firstStderrAt,
-        startedAt,
-        durationMs: Number((performance.now() - startedMonotonicMs).toFixed(3)),
-        timerIdentity: timedOut ? 'runtime_deadline' : null,
-        terminationCause,
-      }
-      lifecycle('child_closed', diagnosticsWithoutContent(diagnostics))
-      resolve(diagnostics)
+      const cause = terminationCause || (signal ? 'signal_exit' : code === 0 ? 'completed' : 'nonzero_exit')
+      settle(code, signal, cause)
     })
   })
+}
+
+export async function runBoundedCleanup(cleanup, timeoutMs = 2_000) {
+  let timer
+  try {
+    await Promise.race([
+      Promise.resolve().then(cleanup),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('Invocation cleanup exceeded its external deadline.')
+          error.code = 'helm_link_cleanup_timeout'
+          reject(error)
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function diagnosticsWithoutContent(result) {

@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import { generateKeyPairSync } from 'node:crypto'
 import { chmodSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import {
   advisoryArgs,
   extractStructuredModel,
@@ -14,6 +16,7 @@ import {
   runOpenClawAdvisory,
   registerInvocationClaim,
   acquireBindingFence,
+  runBoundedCleanup,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
 
 const plist = buildLaunchdPlist({
@@ -75,11 +78,36 @@ assert.equal(extractStructuredText(malformed.stdout), '')
 
 const nonzero = await runScenario('nonzero')
 assert.equal(nonzero.code, 9)
+assert.equal(nonzero.terminationCause, 'nonzero_exit')
 assert.equal(extractStructuredText(nonzero.stdout), '')
 
 const timedOut = await runScenario('timeout', 50)
 assert.equal(timedOut.timedOut, true)
 assert.equal(timedOut.terminationCause, 'parent_timeout')
+
+const stdoutOverflow = await runScenario('stdout-overflow', 2000, { outputLimit: 64 })
+assert.equal(stdoutOverflow.terminationCause, 'stdout_overflow')
+assert.equal(stdoutOverflow.stdoutTruncated, true)
+const stderrOverflow = await runScenario('stderr-overflow', 2000, { stderrLimit: 64 })
+assert.equal(stderrOverflow.terminationCause, 'stderr_overflow')
+assert.equal(stderrOverflow.stderrTruncated, true)
+
+const neverCloses = await runOpenClawAdvisory({
+  args: ['agent'], timeoutMs: 5, sigtermGraceMs: 5, closeTimeoutMs: 5,
+  spawnImpl: () => {
+    const child = new EventEmitter()
+    child.pid = 999
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => true
+    return child
+  },
+})
+assert.equal(neverCloses.terminationCause, 'close_timeout')
+await assert.rejects(runBoundedCleanup(() => new Promise(() => {}), 5),
+  (error) => error?.code === 'helm_link_cleanup_timeout')
+const spawnError = await runOpenClawAdvisory({ args: ['agent'], binary: '/definitely/missing/openclaw' })
+assert.equal(spawnError.terminationCause, 'spawn_error')
 assert.equal(extractStructuredText(timedOut.stdout), '')
 
 const zeroContent = await runScenario('zero-content')
@@ -170,12 +198,14 @@ console.log('VERIFIED bounded HTTP headers/body and data-plane-derived presence'
 console.log('VERIFIED typed termination diagnostics and independent stdout/stderr counters')
 console.log('VERIFIED local claim is registered with server before spawn')
 console.log('VERIFIED connector acquires and persists monotonic fencing ownership')
+console.log('VERIFIED timeout, overflow, signal escalation, close, and cleanup bounds')
 
-async function runScenario(scenario, timeoutMs = 2000) {
+async function runScenario(scenario, timeoutMs = 2000, options = {}) {
   return runOpenClawAdvisory({
     binary: fixture,
     args: ['agent', '--agent', 'fixture-agent', '--message', 'fixture', '--json'],
     timeoutMs,
     env: { ...process.env, FAKE_OPENCLAW_SCENARIO: scenario },
+    ...options,
   })
 }
