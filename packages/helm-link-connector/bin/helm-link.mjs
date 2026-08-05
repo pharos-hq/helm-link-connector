@@ -24,6 +24,7 @@ import {
   recoverAmbiguousInvocations,
   writeTerminalOutbox,
 } from '../lib/terminal-store.mjs'
+import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
 const VERSION = '0.1.9'
@@ -150,14 +151,32 @@ function runtimeModelForAgent(agentId) {
   }
 }
 
-export function advisoryArgs(agentId, bindingId, text) {
+export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false } = {}) {
   if (DENIED.test(text)) throw new Error('Advisory-only Helm Link accepts chat, not tool or execution commands.')
+  if (classifyWorkloadText(text).lane !== 'chat') throw new Error('Operational work requires a durable Helm Link Run.')
+  if (!noToolsAttested) throw new Error('Chat lane requires a host-attested no-tools advisory agent.')
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-message-'))
   const file = join(dir, 'message.txt')
   writePrivate(file, text)
   return {
     args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-link:${bindingId}`, '--message-file', file, '--timeout', '120', '--json'],
+    cleanup() {
+      try { unlinkSync(file) } catch {}
+      try { rmSync(dir, { recursive: true, force: true }) } catch {}
+    },
+  }
+}
+
+export function operationalArgs(agentId, bindingId, dispatchId, text, contract) {
+  const run = validateRunContract(contract)
+  if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
+  const dir = mkdtempSync(join(tmpdir(), 'helm-link-run-'))
+  const file = join(dir, 'message.txt')
+  writePrivate(file, text)
+  return {
+    args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-run:${bindingId}:${dispatchId}`, '--message-file', file, '--timeout', String(Math.ceil(run.deadlineMs / 1000)), '--json'],
+    timeoutMs: run.deadlineMs + 5_000,
     cleanup() {
       try { unlinkSync(file) } catch {}
       try { rmSync(dir, { recursive: true, force: true }) } catch {}
@@ -304,6 +323,7 @@ async function connect(args) {
     processedDispatchIds: [],
     eventStateByDispatch: {},
     status: 'paired',
+    advisoryNoToolsAttested: args['advisory-no-tools-attested'] === true,
   })
   let service = null
   if (args['install-service']) service = installService()
@@ -546,8 +566,11 @@ async function handleDispatch(state, dispatch, liveness) {
     invocationId,
     fencingToken: claim.fencingToken,
   })
-  const text = dispatch.payload?.text
-  const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
+  const text = String(dispatch.payload?.text || '')
+  const lane = dispatch.payload?.kind === 'run' ? 'run' : 'chat'
+  const invocation = lane === 'run'
+    ? operationalArgs(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract)
+    : advisoryArgs(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
   state.activeInvocationId = invocationId
   liveness.activeDispatchId = dispatch.id
   liveness.activeDispatchStartedAt = Date.now()
@@ -557,6 +580,7 @@ async function handleDispatch(state, dispatch, liveness) {
     liveness.lastDispatchProgressAt = Date.now()
     const result = await runOpenClawAdvisory({
       args: invocation.args,
+      timeoutMs: invocation.timeoutMs,
       lifecycle: (kind, fields) => journal(kind, {
         dispatchId: dispatch.id,
         bindingId: state.bindingId,

@@ -38,7 +38,7 @@ const root = resolve(import.meta.dirname, '..')
 const fixture = join(root, 'tests/fixtures/fake-openclaw.mjs')
 chmodSync(fixture, 0o755)
 
-const invocation = advisoryArgs('fixture-agent', 'binding-123', 'safe advisory text')
+const invocation = advisoryArgs('fixture-agent', 'binding-123', 'safe advisory text', { noToolsAttested: true })
 try {
   assert.ok(invocation.args.includes('--json'), 'agent invocation must require structured JSON')
 } finally {
