@@ -18,12 +18,12 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.1.9')
+  assert.equal(manifest.version, '0.2.0-architecture.0')
   assert.equal(
     manifest.archive.sha256,
-    '70a4095f060bf61d44e798d666f73d0805cfe27b217085fad9995d47ace64166',
+    '4fbddcd5191423387610ff11e3337b14b808e774b36b9c4b23ddfc90a5ca3b97',
   )
-  assert.equal(Object.keys(manifest.files).length, 8)
+  assert.equal(Object.keys(manifest.files).length, 12)
 
   for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
     const body = readFileSync(join(root, relativePath))
@@ -40,6 +40,10 @@ try {
     'package/LICENSE',
     'package/README.md',
     'package/bin/helm-link.mjs',
+    'package/lib/invocation-claims.mjs',
+    'package/lib/lifecycle-journal.mjs',
+    'package/lib/terminal-store.mjs',
+    'package/lib/workload-contract.mjs',
     'package/package.json',
     'package/supervisors/container/docker-compose.yml',
     'package/supervisors/launchd/com.helm.link.plist',
@@ -54,8 +58,8 @@ try {
   assert.match(workflow, /tags:\s*\n\s*- 'helm-link-connector-v\*'/)
   assert.match(workflow, /id-token: write/)
   assert.match(workflow, /--provenance/)
-  assert.match(workflow, /EXPECTED_SHA256/)
-  assert.match(workflow, new RegExp(manifest.archive.sha256))
+  assert.doesNotMatch(workflow, /0\.2\.0-architecture\.0/,
+    'architecture candidate must not be publishable before a separate release gate')
   assert.doesNotMatch(
     workflow,
     /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|npm login|npm adduser/,
@@ -107,7 +111,8 @@ try {
     'fixture-agent',
   )
 
-  console.log('VERIFIED source manifest: 8 audited package files')
+  console.log('VERIFIED source manifest: 12 audited package files')
+  console.log('VERIFIED architecture candidate is not wired to publication')
   console.log(`VERIFIED release SHA-256: ${first.hash}`)
   console.log('VERIFIED tokenless tag-bound OIDC workflow')
   console.log('VERIFIED installed CLI doctor contract')

@@ -1,0 +1,81 @@
+{
+  "schema": "helm-link.chaos-matrix.v1",
+  "originalTerminalDispatch": "de44731b-be35-415a-9be7-a684917bcc37",
+  "capacityInvariant": 1,
+  "totals": {
+    "passed": 14,
+    "failed": 0
+  },
+  "results": [
+    {
+      "name": "crash-before-fsync",
+      "invariant": "No durable claim means no execution evidence was fabricated.",
+      "status": "passed"
+    },
+    {
+      "name": "crash-after-fsync-before-spawn",
+      "invariant": "A durable claim permanently rejects a second spawn.",
+      "status": "passed"
+    },
+    {
+      "name": "duplicate-connectors",
+      "invariant": "Exclusive claim creation permits only one connector winner.",
+      "status": "passed"
+    },
+    {
+      "name": "ambiguous-restart",
+      "invariant": "Claimed work without a terminal becomes unknown and never replays.",
+      "status": "passed"
+    },
+    {
+      "name": "post-terminal-pre-ack",
+      "invariant": "Terminal outbox survives until an idempotent delivery marker exists.",
+      "status": "passed"
+    },
+    {
+      "name": "terminal-replay-sentinel",
+      "invariant": "The original terminal dispatch is rejected after cache pruning.",
+      "status": "passed"
+    },
+    {
+      "name": "parent-timeout",
+      "invariant": "Runtime deadline emits parent_timeout.",
+      "status": "passed"
+    },
+    {
+      "name": "stdout-overflow",
+      "invariant": "Stdout overflow is distinct and bounded.",
+      "status": "passed"
+    },
+    {
+      "name": "stderr-overflow",
+      "invariant": "Stderr overflow is distinct and never customer content.",
+      "status": "passed"
+    },
+    {
+      "name": "ignored-sigterm",
+      "invariant": "Ignored SIGTERM escalates to SIGKILL within a bound.",
+      "status": "passed"
+    },
+    {
+      "name": "close-hang",
+      "invariant": "A child that never closes resolves as close_timeout.",
+      "status": "passed"
+    },
+    {
+      "name": "cleanup-hang",
+      "invariant": "Cleanup has an independent deadline.",
+      "status": "passed"
+    },
+    {
+      "name": "stale-fencing",
+      "invariant": "Non-monotonic fencing ownership fails closed.",
+      "status": "passed"
+    },
+    {
+      "name": "presence-telemetry-contention-queue",
+      "invariant": "Presence/telemetry failure and runtime unknown do not violate capacity one.",
+      "status": "passed"
+    }
+  ]
+}

@@ -11,6 +11,10 @@ code, or paste or screenshot the command. Version `0.1.9` is eligible for
 publication only through the repository's tag-bound GitHub OIDC workflow with
 npm provenance.
 
+The `0.2.0-architecture.0` source is an unpublished review candidate. It is
+intentionally absent from the tag-bound publication workflow and must not be
+installed on a live binding before a separate staging release gate.
+
 The deterministic CI artifact has an exact SHA-256 in `SHA256SUMS`, but it is
 not the customer installation channel. Current Ubuntu VM and Node 22 container
 checks use a fake OpenClaw fixture and prove portability/discovery, not a real
