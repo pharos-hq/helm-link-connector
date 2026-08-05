@@ -592,6 +592,30 @@ export function classifyCancellationTerminal(cancellation) {
   return { terminalCode, terminalSummary }
 }
 
+export async function settleCancellationAuthority(cancellation, {
+  timeoutMs = 7_500,
+  sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  if (cancellation?.requested !== true || cancellation.resolved === true) return cancellation
+  const deadline = Date.now() + timeoutMs
+  while (cancellation.resolved !== true && Date.now() < deadline) await sleepImpl(10)
+  return cancellation
+}
+
+function gatewayEnvelopeOutcome(stdout) {
+  try {
+    const value = JSON.parse(stdout)
+    return {
+      status: typeof value?.status === 'string' ? value.status : null,
+      summary: typeof value?.summary === 'string' ? value.summary.slice(0, 80) : null,
+      stopReason: typeof value?.stopReason === 'string' ? value.stopReason : null,
+      aborted: value?.result?.aborted === true || value?.result?.meta?.aborted === true,
+    }
+  } catch {
+    return { status: null, summary: null, stopReason: null, aborted: false }
+  }
+}
+
 export async function handleDispatch(state, dispatch, liveness) {
   if (readTerminalRecord(STATE_DIR, dispatch.id)) return
   if (state.pendingAcks?.[dispatch.id]) {
@@ -644,14 +668,45 @@ export async function handleDispatch(state, dispatch, liveness) {
         startedAt,
       }),
     })
+    const envelope = gatewayEnvelopeOutcome(result.stdout)
+    journal('execution_process_settled', {
+      dispatchId: dispatch.id,
+      bindingId: state.bindingId,
+      gatewayRunId: liveness.activeGatewayRunId,
+      terminationCause: result.terminationCause,
+      exitCode: result.code ?? null,
+      signal: result.signal ?? null,
+      stdoutBytes: result.stdoutBytes ?? 0,
+      stderrBytes: result.stderrBytes ?? 0,
+      gatewayStatus: envelope.status,
+      gatewayStopReason: envelope.stopReason,
+      gatewayAborted: envelope.aborted,
+      cancellationRequested: liveness.cancellation?.requested === true,
+    })
+    // A durable cancellation request is authoritative even when the OpenClaw
+    // CLI exits zero with a structured `status=timeout, stopReason=aborted`
+    // envelope. Process exit zero means the RPC completed; it does not mean the
+    // agent Run completed successfully. Never let ordinary completion win once
+    // cancellation intent has crossed the durable Helm boundary.
+    if (liveness.cancellation?.requested === true) {
+      await settleCancellationAuthority(liveness.cancellation)
+      const { terminalCode, terminalSummary: summary } = classifyCancellationTerminal(liveness.cancellation)
+      journal('cancellation_terminal_selected', {
+        dispatchId: dispatch.id,
+        bindingId: state.bindingId,
+        gatewayRunId: liveness.activeGatewayRunId,
+        requestedAt: liveness.cancellation.requestedAt,
+        cancellationResolved: liveness.cancellation.resolved === true,
+        gatewayCancelled: liveness.cancellation.cancelled === true,
+        providerStarted: liveness.cancellation.providerStarted,
+        terminalCode,
+      })
+      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
+      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
+        state: 'failed', terminalCode, terminalSummary: summary }, liveness)
+      return
+    }
     if (result.terminationCause !== 'completed') {
-      if (liveness.cancellation?.requested === true) {
-        const { terminalCode, terminalSummary: summary } = classifyCancellationTerminal(liveness.cancellation)
-        await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-        await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
-          state: 'failed', terminalCode, terminalSummary: summary }, liveness)
-        return
-      }
       const terminalByCause = {
         parent_timeout: ['openclaw_parent_timeout', 'OpenClaw advisory exceeded its parent deadline; no customer content produced.'],
         stdout_overflow: ['openclaw_stdout_overflow', 'OpenClaw stdout exceeded its bound; no customer content produced.'],
@@ -1106,6 +1161,7 @@ export async function runConnectorLoops(state, options = {}) {
   }
   const cancellationLoop = async () => {
     let lastRequestedAt = null
+    const journal = createLifecycleJournal(LIFECYCLE_FILE)
     while (!stopped()) {
       try {
         if (liveness.activeDispatchId) {
@@ -1115,12 +1171,24 @@ export async function runConnectorLoops(state, options = {}) {
           })
           if (body.cancellation?.requestedAt && body.cancellation.requestedAt !== lastRequestedAt) {
             lastRequestedAt = body.cancellation.requestedAt
+            journal('cancellation_request_observed', {
+              dispatchId: liveness.activeDispatchId,
+              bindingId: state.bindingId,
+              gatewayRunId: liveness.activeGatewayRunId,
+              requestedAt: body.cancellation.requestedAt,
+            })
             // Publish cancellation intent before awaiting Gateway. The original
             // child may terminate first; that race must enter the same absorbing
             // terminal path as a completed cancel response, never the generic
             // process-failure path.
             await requestGatewayCancellation(state, liveness, body.cancellation.requestedAt, {
               cancelImpl: options.cancelImpl || cancelGatewayAgentRun,
+              lifecycle: (kind, fields) => journal(kind, {
+                dispatchId: liveness.activeDispatchId,
+                bindingId: state.bindingId,
+                gatewayRunId: liveness.activeGatewayRunId,
+                ...fields,
+              }),
             })
           }
         } else lastRequestedAt = null
@@ -1133,6 +1201,7 @@ export async function runConnectorLoops(state, options = {}) {
 
 export async function requestGatewayCancellation(state, liveness, requestedAt, {
   cancelImpl = cancelGatewayAgentRun,
+  lifecycle = () => {},
 } = {}) {
   const cancellation = {
     requested: true,
@@ -1145,10 +1214,22 @@ export async function requestGatewayCancellation(state, liveness, requestedAt, {
   // intent even if the original child exits before agent.cancel returns.
   liveness.cancellation = cancellation
   try {
+    lifecycle('gateway_cancel_request_started', { requestedAt })
     const outcome = await cancelImpl(state, liveness.activeGatewayRunId)
     Object.assign(cancellation, outcome, { resolved: true })
+    lifecycle('gateway_cancel_response', {
+      requestedAt,
+      cancelled: cancellation.cancelled === true,
+      providerStarted: cancellation.providerStarted,
+      status: typeof cancellation.status === 'string' ? cancellation.status : null,
+    })
   } catch (error) {
     Object.assign(cancellation, { resolved: true, error: error?.message || String(error) })
+    lifecycle('gateway_cancel_error', {
+      requestedAt,
+      errorName: error?.name || 'Error',
+      errorCode: error?.code || null,
+    })
   }
   return cancellation
 }
