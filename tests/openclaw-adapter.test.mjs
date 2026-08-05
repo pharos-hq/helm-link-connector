@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { generateKeyPairSync } from 'node:crypto'
 import { chmodSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import {
@@ -8,6 +9,8 @@ import {
   extractStructuredModel,
   extractStructuredText,
   buildLaunchdPlist,
+  deriveLivenessPresence,
+  postJson,
   runOpenClawAdvisory,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
 
@@ -79,8 +82,36 @@ assert.ok(!extractStructuredText(zeroContent.stdout).includes('must not escape')
 assert.equal(extractStructuredText('{"status":"ok","result":{"payloads":"not-an-array"}}'), '')
 assert.equal(extractStructuredText('raw stdout that resembles customer content'), '')
 
+assert.equal(deriveLivenessPresence({ lastPollCompletedAt: 0 }), 'connecting')
+assert.equal(deriveLivenessPresence({
+  lastPollCompletedAt: 100_000,
+  lastDispatchProgressAt: 0,
+  pollStartedAt: 0,
+}, 100_001), 'online')
+assert.equal(deriveLivenessPresence({
+  lastPollCompletedAt: 1,
+  lastDispatchProgressAt: 0,
+  pollStartedAt: 0,
+}, 90_001), 'degraded')
+
+const pair = generateKeyPairSync('ed25519')
+await assert.rejects(
+  postJson({
+    server: 'https://example.invalid',
+    bindingId: '00000000-0000-4000-8000-000000000001',
+    privateKeyPem: pair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+  }, '/hung', {}, {
+    timeoutMs: 20,
+    fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    }),
+  }),
+  (error) => error?.code === 'helm_link_request_timeout',
+)
+
 console.log('VERIFIED OpenClaw 2026.7.1 structured-output contract')
 console.log('VERIFIED malformed, non-zero, timeout, and zero-content fail closed')
+console.log('VERIFIED bounded HTTP requests and data-plane-derived presence')
 
 async function runScenario(scenario, timeoutMs = 2000) {
   return runOpenClawAdvisory({
