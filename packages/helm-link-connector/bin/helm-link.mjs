@@ -478,7 +478,7 @@ export function deriveLivenessPresence(liveness, nowMs = Date.now()) {
   return pollHung || dataPlaneStale ? 'degraded' : 'online'
 }
 
-async function presence(state, liveness, value = deriveLivenessPresence(liveness)) {
+async function presence(state, liveness, value = deriveLivenessPresence(liveness), telemetry = {}) {
   return postJson(state, '/api/helm-link/connector/presence', {
     protocolVersion: PROTOCOL,
     presence: value,
@@ -486,9 +486,9 @@ async function presence(state, liveness, value = deriveLivenessPresence(liveness
     hostOs: `${platform()} ${release()}`,
     nodeVersion: process.version,
     connectorVersion: VERSION,
-    openclawVersion: openclawVersion(),
+    openclawVersion: telemetry.openclawVersion ?? null,
     compatibility: 'supported',
-    runtimeModel: runtimeModelForAgent(state.runtimeAgentId),
+    runtimeModel: telemetry.runtimeModel ?? null,
     diagnostics: {
       openclaw: resolveOpenClaw(),
       dataPlane: value === 'online' ? 'healthy' : value,
@@ -966,54 +966,109 @@ async function runLoop() {
   migrateProcessedLedger(STATE_DIR, state)
   await acquireBindingFence(state)
   recoverAmbiguousInvocations(STATE_DIR, state, listInvocationClaims(STATE_DIR))
+  await runConnectorLoops(state)
+}
+
+export async function runConnectorLoops(state, options = {}) {
+  const postImpl = options.postImpl || postJson
+  const handleImpl = options.handleImpl || handleDispatch
+  const presenceImpl = options.presenceImpl || presence
+  const telemetryImpl = options.telemetryImpl || collectTelemetry
+  const sleepImpl = options.sleepImpl || sleep
+  const signal = options.signal
+  const idlePollMs = options.idlePollMs ?? 5_000
+  const busyCheckMs = options.busyCheckMs ?? 100
+  const presenceMs = options.presenceMs ?? 30_000
+  const telemetryMs = options.telemetryMs ?? 30_000
+  const telemetryTimeoutMs = options.telemetryTimeoutMs ?? 40_000
   const liveness = {
-    lastPollCompletedAt: 0,
-    pollStartedAt: 0,
-    lastDispatchProgressAt: 0,
-    activeDispatchId: null,
-    activeDispatchStartedAt: null,
+    lastPollCompletedAt: 0, pollStartedAt: 0, lastDispatchProgressAt: 0,
+    activeDispatchId: null, activeDispatchStartedAt: null,
   }
-  let presenceTimer = null
-  for (;;) {
-    try {
-      if (!presenceTimer) {
-        await presence(state, liveness)
-        let presenceInFlight = false
-        presenceTimer = setInterval(() => {
-          if (presenceInFlight) return
-          presenceInFlight = true
-          void presence(state, liveness)
-            .catch((error) => console.error(`[helm-link] presence heartbeat failed: ${error.message}`))
-            .finally(() => { presenceInFlight = false })
-        }, 30_000)
-      }
-      await flushPendingAcks(state, liveness)
-      liveness.pollStartedAt = Date.now()
-      const body = await postJson(state, '/api/helm-link/connector/poll', { protocolVersion: PROTOCOL })
-      liveness.pollStartedAt = 0
-      liveness.lastPollCompletedAt = Date.now()
-      if (body.dispatch) await handleDispatch(state, body.dispatch, liveness)
-      else await sleep(body.retryAfterMs || 5000)
-    } catch (error) {
-      liveness.pollStartedAt = 0
-      if (error.status === 403 || error.status === 410 || /revoked/i.test(error.message)) {
-        state.status = 'revoked'
-        state.revokedAt = new Date().toISOString()
-        saveState(state)
-        if (presenceTimer) clearInterval(presenceTimer)
-        // HFA-005 — revocation is terminal. Exit non-zero with a stable
-        // sentinel code so packaged supervisors can distinguish owner
-        // revocation from transient failure.
-        // launchd/container: run-supervised.sh maps 75 to a clean stop.
-        // systemd: Restart=on-failure + RestartPreventExitStatus=75.
-        // Docker: wrapper + bounded on-failure retries.
-        console.error('[helm-link] binding revoked; stopping connector loop (terminal)')
-        process.exit(75)
-      }
-      console.error(`[helm-link] ${error.message}`)
-      await sleep(5000)
+  const queue = []
+  const telemetry = { openclawVersion: null, runtimeModel: null, updatedAt: null }
+  let executing = false
+  const stopped = () => signal?.aborted === true
+  const pause = (ms) => stopped() ? Promise.resolve() : sleepImpl(ms)
+
+  const acquisitionLoop = async () => {
+    while (!stopped()) {
+      if (executing || queue.length) { await pause(busyCheckMs); continue }
+      try {
+        liveness.pollStartedAt = Date.now()
+        const body = await postImpl(state, '/api/helm-link/connector/poll', { protocolVersion: PROTOCOL })
+        liveness.lastPollCompletedAt = Date.now()
+        if (body.dispatch) queue.push(body.dispatch)
+        else await pause(body.retryAfterMs ?? idlePollMs)
+      } catch (error) {
+        if (isTerminalConnectorError(error)) throw error
+        console.error(`[helm-link] acquisition failed: ${error.message}`)
+        await pause(idlePollMs)
+      } finally { liveness.pollStartedAt = 0 }
     }
   }
+  const executionLoop = async () => {
+    while (!stopped()) {
+      const dispatch = queue.shift()
+      if (!dispatch) { await pause(busyCheckMs); continue }
+      executing = true
+      try { await handleImpl(state, dispatch, liveness) }
+      catch (error) { console.error(`[helm-link] execution failed: ${error.message}`) }
+      finally { executing = false }
+    }
+  }
+  const presenceLoop = async () => {
+    while (!stopped()) {
+      try { await presenceImpl(state, liveness, deriveLivenessPresence(liveness), telemetry) }
+      catch (error) { console.error(`[helm-link] presence failed: ${error.message}`) }
+      await pause(presenceMs)
+    }
+  }
+  const telemetryLoop = async () => {
+    while (!stopped()) {
+      try {
+        const next = await withDeadline(telemetryImpl(state), telemetryTimeoutMs, 'telemetry')
+        Object.assign(telemetry, next, { updatedAt: new Date().toISOString() })
+      } catch (error) { console.error(`[helm-link] telemetry failed: ${error.message}`) }
+      await pause(telemetryMs)
+    }
+  }
+  await Promise.all([acquisitionLoop(), executionLoop(), presenceLoop(), telemetryLoop()])
+}
+
+async function collectTelemetry(state) {
+  const [versionResult, agentsResult] = await Promise.all([
+    runOpenClawAdvisory({ args: ['--version'], timeoutMs: 10_000, outputLimit: 10_000, stderrLimit: 10_000 }),
+    runOpenClawAdvisory({ args: ['agents', 'list', '--json'], timeoutMs: 30_000, outputLimit: 250_000, stderrLimit: 50_000 }),
+  ])
+  let runtimeModel = null
+  if (agentsResult.terminationCause === 'completed') {
+    try {
+      const parsed = JSON.parse(agentsResult.stdout)
+      const agents = Array.isArray(parsed) ? parsed : parsed.agents || []
+      const agent = agents.find((item) => String(item.id || item.agentId || item.name) === state.runtimeAgentId)
+      const configured = String(agent?.model ?? agent?.modelId ?? '').trim()
+      if (configured) runtimeModel = { configured, provider: configured.split('/')[0] || 'unknown' }
+    } catch {}
+  }
+  return {
+    openclawVersion: versionResult.terminationCause === 'completed' ? versionResult.stdout.trim().slice(0, 120) : null,
+    runtimeModel,
+  }
+}
+
+function withDeadline(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms`)), timeoutMs)
+    Promise.resolve(promise).then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+function isTerminalConnectorError(error) {
+  return error?.status === 403 || error?.status === 410 || /revoked/i.test(error?.message || '')
 }
 
 export async function acquireBindingFence(state, { postImpl = postJson, persist = saveState } = {}) {
