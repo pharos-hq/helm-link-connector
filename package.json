@@ -7,7 +7,7 @@
     "node": ">=22 <25"
   },
   "scripts": {
-    "test": "node tests/lifecycle-journal.test.mjs && node tests/invocation-claims.test.mjs && node tests/terminal-store.test.mjs && node tests/workload-contract.test.mjs && node tests/openclaw-adapter.test.mjs && node tests/loop-decomposition.test.mjs && node tests/chaos-matrix.test.mjs && node tests/launchd-lifecycle.test.mjs",
+    "test": "node tests/lifecycle-journal.test.mjs && node tests/invocation-claims.test.mjs && node tests/terminal-store.test.mjs && node tests/workload-contract.test.mjs && node tests/openclaw-adapter.test.mjs && node tests/cancellation-authority.test.mjs && node tests/loop-decomposition.test.mjs && node tests/chaos-matrix.test.mjs && node tests/launchd-lifecycle.test.mjs",
     "test:release": "node tests/release-boundary.test.mjs"
   }
 }

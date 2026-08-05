@@ -570,7 +570,21 @@ export function prepareTerminalDelivery(state, acknowledgement) {
   }
 }
 
-async function handleDispatch(state, dispatch, liveness) {
+export function classifyCancellationTerminal(cancellation) {
+  const providerStarted = cancellation?.providerStarted === true
+  const confirmed = cancellation?.resolved === true && cancellation?.cancelled === true
+  const terminalCode = confirmed
+    ? providerStarted ? 'cancelled_during_execution' : 'cancelled_before_provider'
+    : 'execution_outcome_unknown'
+  const terminalSummary = confirmed
+    ? providerStarted
+      ? 'Run cancellation was confirmed after provider execution began.'
+      : 'Run cancellation was confirmed before provider execution began.'
+    : 'Cancellation raced a Gateway interruption; execution outcome is unknown and replay is forbidden.'
+  return { terminalCode, terminalSummary }
+}
+
+export async function handleDispatch(state, dispatch, liveness) {
   if (readTerminalRecord(STATE_DIR, dispatch.id)) return
   if (state.pendingAcks?.[dispatch.id]) {
     await flushPendingAcks(state, liveness)
@@ -623,17 +637,8 @@ async function handleDispatch(state, dispatch, liveness) {
       }),
     })
     if (result.terminationCause !== 'completed') {
-      if (liveness.cancellation) {
-        const providerStarted = liveness.cancellation.providerStarted === true
-        const confirmed = liveness.cancellation.cancelled === true
-        const terminalCode = confirmed
-          ? providerStarted ? 'cancelled_during_execution' : 'cancelled_before_provider'
-          : 'execution_outcome_unknown'
-        const summary = confirmed
-          ? providerStarted
-            ? 'Run cancellation was confirmed after provider execution began.'
-            : 'Run cancellation was confirmed before provider execution began.'
-          : 'Cancellation raced a Gateway interruption; execution outcome is unknown and replay is forbidden.'
+      if (liveness.cancellation?.requested === true) {
+        const { terminalCode, terminalSummary: summary } = classifyCancellationTerminal(liveness.cancellation)
         await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
         await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
           state: 'failed', terminalCode, terminalSummary: summary }, liveness)
@@ -1101,7 +1106,11 @@ export async function runConnectorLoops(state, options = {}) {
           })
           if (body.cancellation?.requestedAt && body.cancellation.requestedAt !== lastRequestedAt) {
             lastRequestedAt = body.cancellation.requestedAt
-            liveness.cancellation = await cancelGatewayAgentRun(state, liveness.activeGatewayRunId)
+            // Publish cancellation intent before awaiting Gateway. The original
+            // child may terminate first; that race must enter the same absorbing
+            // terminal path as a completed cancel response, never the generic
+            // process-failure path.
+            await requestGatewayCancellation(state, liveness, body.cancellation.requestedAt)
           }
         } else lastRequestedAt = null
       } catch (error) { console.error(`[helm-link] cancellation check failed: ${error.message}`) }
@@ -1109,6 +1118,28 @@ export async function runConnectorLoops(state, options = {}) {
     }
   }
   await Promise.all([acquisitionLoop(), executionLoop(), presenceLoop(), telemetryLoop(), cancellationLoop()])
+}
+
+export async function requestGatewayCancellation(state, liveness, requestedAt, {
+  cancelImpl = cancelGatewayAgentRun,
+} = {}) {
+  const cancellation = {
+    requested: true,
+    requestedAt,
+    resolved: false,
+    cancelled: false,
+    providerStarted: null,
+  }
+  // Synchronous publication is the race boundary: handleDispatch can now see
+  // intent even if the original child exits before agent.cancel returns.
+  liveness.cancellation = cancellation
+  try {
+    const outcome = await cancelImpl(state, liveness.activeGatewayRunId)
+    Object.assign(cancellation, outcome, { resolved: true })
+  } catch (error) {
+    Object.assign(cancellation, { resolved: true, error: error?.message || String(error) })
+  }
+  return cancellation
 }
 
 export async function cancelGatewayAgentRun(state, runId, { runImpl = runOpenClawAdvisory } = {}) {

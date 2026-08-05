@@ -21,7 +21,7 @@ try {
   assert.equal(manifest.version, '0.2.0-architecture.0')
   assert.equal(
     manifest.archive.sha256,
-    '6381ede68579c493a61c8a18936dc5ccb410eacf9e99cc58e4fb726be8bfaf8b',
+    '54c3d5765ceb276a1391796d38574d028b2f53b0679e5d836cfb00cc0b1c1723',
   )
   assert.equal(Object.keys(manifest.files).length, 12)
 
