@@ -478,7 +478,20 @@ export function deriveLivenessPresence(liveness, nowMs = Date.now()) {
   return pollHung || dataPlaneStale ? 'degraded' : 'online'
 }
 
+export function deriveTwoAxisState(liveness, nowMs = Date.now()) {
+  const latestProgress = Math.max(liveness.lastPollCompletedAt || 0, liveness.lastDispatchProgressAt || 0)
+  const age = latestProgress ? nowMs - latestProgress : Number.POSITIVE_INFINITY
+  const connectionHealth = age < DATA_PLANE_STALE_MS
+    ? 'available'
+    : age < DATA_PLANE_STALE_MS * 3 ? 'degraded' : 'offline'
+  const workloadState = liveness.activeDispatchId
+    ? 'busy'
+    : Number(liveness.queueDepth || 0) > 0 ? 'queued' : 'idle'
+  return { connectionHealth, workloadState }
+}
+
 async function presence(state, liveness, value = deriveLivenessPresence(liveness), telemetry = {}) {
+  const axes = deriveTwoAxisState(liveness)
   return postJson(state, '/api/helm-link/connector/presence', {
     protocolVersion: PROTOCOL,
     presence: value,
@@ -488,6 +501,13 @@ async function presence(state, liveness, value = deriveLivenessPresence(liveness
     connectorVersion: VERSION,
     openclawVersion: telemetry.openclawVersion ?? null,
     compatibility: 'supported',
+    connectionHealth: axes.connectionHealth,
+    workloadState: axes.workloadState,
+    queueDepth: Number(liveness.queueDepth || 0),
+    functional: {
+      lastPollCompletedAt: liveness.lastPollCompletedAt ? new Date(liveness.lastPollCompletedAt).toISOString() : null,
+      lastDispatchProgressAt: liveness.lastDispatchProgressAt ? new Date(liveness.lastDispatchProgressAt).toISOString() : null,
+    },
     runtimeModel: telemetry.runtimeModel ?? null,
     diagnostics: {
       openclaw: resolveOpenClaw(),
@@ -983,7 +1003,7 @@ export async function runConnectorLoops(state, options = {}) {
   const telemetryTimeoutMs = options.telemetryTimeoutMs ?? 40_000
   const liveness = {
     lastPollCompletedAt: 0, pollStartedAt: 0, lastDispatchProgressAt: 0,
-    activeDispatchId: null, activeDispatchStartedAt: null,
+    activeDispatchId: null, activeDispatchStartedAt: null, queueDepth: 0,
   }
   const queue = []
   const telemetry = { openclawVersion: null, runtimeModel: null, updatedAt: null }
@@ -999,10 +1019,11 @@ export async function runConnectorLoops(state, options = {}) {
         const body = await postImpl(state, '/api/helm-link/connector/poll', {
           protocolVersion: PROTOCOL,
           localCapacity,
-          runtimeState: telemetry.updatedAt ? 'free' : 'unknown',
+          runtimeState: telemetry.runtimeState || 'unknown',
           runtimeStateObservedAt: telemetry.updatedAt,
         })
         liveness.lastPollCompletedAt = Date.now()
+        liveness.queueDepth = Number(body.queueDepth || 0)
         if (body.dispatch && localCapacity === 0) throw new Error('Server dispatched work at zero local capacity.')
         if (body.dispatch) queue.push(body.dispatch)
         else await pause(body.retryAfterMs ?? idlePollMs)
@@ -1018,6 +1039,7 @@ export async function runConnectorLoops(state, options = {}) {
       const dispatch = queue.shift()
       if (!dispatch) { await pause(busyCheckMs); continue }
       executing = true
+      liveness.queueDepth = Math.max(0, liveness.queueDepth - 1)
       try { await handleImpl(state, dispatch, liveness) }
       catch (error) { console.error(`[helm-link] execution failed: ${error.message}`) }
       finally { executing = false }
@@ -1060,6 +1082,9 @@ async function collectTelemetry(state) {
   return {
     openclawVersion: versionResult.terminationCause === 'completed' ? versionResult.stdout.trim().slice(0, 120) : null,
     runtimeModel,
+    // Stored-session recency and process existence are not capacity signals.
+    // OpenClaw 2026.7.1 exposes no supported agent-level in-flight primitive.
+    runtimeState: 'unknown',
   }
 }
 

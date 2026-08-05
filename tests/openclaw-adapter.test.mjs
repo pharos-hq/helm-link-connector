@@ -12,6 +12,7 @@ import {
   extractStructuredText,
   buildLaunchdPlist,
   deriveLivenessPresence,
+  deriveTwoAxisState,
   postJson,
   runOpenClawAdvisory,
   registerInvocationClaim,
@@ -129,6 +130,12 @@ assert.equal(deriveLivenessPresence({
   lastDispatchProgressAt: 0,
   pollStartedAt: 0,
 }, 90_001), 'degraded')
+assert.deepEqual(deriveTwoAxisState({ lastPollCompletedAt: 100_000, activeDispatchId: 'd', queueDepth: 2 }, 100_001), {
+  connectionHealth: 'available', workloadState: 'busy',
+})
+assert.deepEqual(deriveTwoAxisState({ lastPollCompletedAt: 1, activeDispatchId: null, queueDepth: 2 }, 100_000), {
+  connectionHealth: 'degraded', workloadState: 'queued',
+})
 
 const pair = generateKeyPairSync('ed25519')
 await assert.rejects(
