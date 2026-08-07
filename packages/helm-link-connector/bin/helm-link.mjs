@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.0-architecture.2'
+const VERSION = '0.2.0'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -518,6 +518,10 @@ async function presence(state, liveness, value = deriveLivenessPresence(liveness
     connectionHealth: axes.connectionHealth,
     workloadState: axes.workloadState,
     queueDepth: Number(liveness.queueDepth || 0),
+    // Blocker 1: fence authorization must be signed. Present the current
+    // ownership epoch inside the signed body; the server never authorizes
+    // from the unsigned `x-helm-link-fencing-token` header.
+    deliveryFencingToken: Number(state.fencingToken || 0),
     functional: {
       lastPollCompletedAt: liveness.lastPollCompletedAt ? new Date(liveness.lastPollCompletedAt).toISOString() : null,
       lastDispatchProgressAt: liveness.lastDispatchProgressAt ? new Date(liveness.lastDispatchProgressAt).toISOString() : null,
@@ -542,24 +546,106 @@ async function acknowledgeTerminal(state, dispatch, acknowledgement, liveness) {
     invocationFencingToken: Number(state.fencingToken || 0),
     deliveryFencingToken: Number(state.fencingToken || 0),
   }
-  recordTerminal(STATE_DIR, {
-    ...durableAck,
-    bindingId: state.bindingId,
-  })
+  // Blocker 3, step 1: durably record terminal-delivery *intent* before any
+  // absorbing local terminal exists. If the server arbitrates cancellation
+  // over our completion, the canonical result the server returns will land
+  // in the local absorbing store — never a conflicting locally-authored one.
   writeTerminalOutbox(STATE_DIR, durableAck)
-  await postJson(state, '/api/helm-link/connector/ack', durableAck)
+  // Blocker 2/3, step 2: post the ack. The server locks the run+dispatch and
+  // returns the canonical absorbing terminal (which may differ from what we
+  // requested if cancellation was already durable).
+  const canonical = await postCommitTerminal(state, durableAck)
+  // Step 3: durably record the canonical terminal locally.
+  recordTerminal(STATE_DIR, {
+    dispatchId: dispatch.id,
+    bindingId: state.bindingId,
+    invocationId: durableAck.invocationId,
+    invocationFencingToken: durableAck.invocationFencingToken,
+    state: canonical.state,
+    terminalCode: canonical.terminalCode,
+    terminalSummary: canonical.terminalSummary,
+    terminalId: canonical.terminalId,
+  })
+  if (canonical.terminalId) {
+    // Step 4/5: signed, fenced, idempotent receipt marks the server outbox
+    // row `delivered` and returns the delivered_at.
+    await postTerminalReceipt(state, {
+      dispatchId: dispatch.id,
+      terminalId: canonical.terminalId,
+    })
+  }
+  // Step 6: local delivery marker so restart-safe scanning skips it.
   markTerminalDelivered(STATE_DIR, dispatch.id)
   liveness.lastDispatchProgressAt = Date.now()
   saveState(state)
 }
 
+export async function postCommitTerminal(state, durableAck, { postImpl = postJson } = {}) {
+  const response = await postImpl(state, '/api/helm-link/connector/ack', durableAck)
+  if (response?.ok === false) {
+    throw new Error('Terminal acknowledgement was not accepted by the server')
+  }
+  const canonical = response?.canonical ?? {}
+  if (typeof response?.terminalId !== 'string' || !response.terminalId) {
+    throw new Error('Terminal acknowledgement did not return a canonical terminal identity')
+  }
+  return {
+    ok: true,
+    duplicate: response?.duplicate === true,
+    arbitrated: response?.arbitrated === true,
+    terminalId: response?.terminalId ?? null,
+    state: canonical.state ?? durableAck.state,
+    terminalCode: canonical.terminalCode ?? durableAck.terminalCode,
+    terminalSummary: canonical.terminalSummary ?? durableAck.terminalSummary,
+  }
+}
+
+export async function postTerminalReceipt(state, { dispatchId, terminalId }, { postImpl = postJson } = {}) {
+  return postImpl(state, '/api/helm-link/connector/receipts', {
+    protocolVersion: PROTOCOL,
+    dispatchId,
+    terminalId,
+    deliveryFencingToken: Number(state.fencingToken || 0),
+  })
+}
+
 async function flushPendingAcks(state, liveness) {
   for (const acknowledgement of pendingTerminalOutbox(STATE_DIR)) {
     const deliverable = prepareTerminalDelivery(state, acknowledgement)
-    await postJson(state, acknowledgement.recovery
-      ? '/api/helm-link/connector/recoveries'
-      : '/api/helm-link/connector/ack', deliverable)
-    markTerminalDelivered(STATE_DIR, acknowledgement.dispatchId)
+    if (acknowledgement.recovery) {
+      const recoveryResponse = await postJson(state, '/api/helm-link/connector/recoveries', deliverable)
+      // The recovery RPC creates the outbox row on the server; the same
+      // explicit receipt closes it out so no relevant outbox row lingers.
+      if (recoveryResponse?.ok === false
+          || typeof recoveryResponse?.terminalId !== 'string'
+          || !recoveryResponse.terminalId) {
+        throw new Error('Ambiguous-outcome recovery did not return a canonical terminal identity')
+      }
+      await postTerminalReceipt(state, {
+        dispatchId: acknowledgement.dispatchId,
+        terminalId: recoveryResponse.terminalId,
+      })
+      markTerminalDelivered(STATE_DIR, acknowledgement.dispatchId)
+    } else {
+      const canonical = await postCommitTerminal(state, deliverable)
+      recordTerminal(STATE_DIR, {
+        dispatchId: acknowledgement.dispatchId,
+        bindingId: state.bindingId,
+        invocationId: deliverable.invocationId ?? null,
+        invocationFencingToken: Number(deliverable.invocationFencingToken || 0),
+        state: canonical.state,
+        terminalCode: canonical.terminalCode,
+        terminalSummary: canonical.terminalSummary,
+        terminalId: canonical.terminalId,
+      })
+      if (canonical.terminalId) {
+        await postTerminalReceipt(state, {
+          dispatchId: acknowledgement.dispatchId,
+          terminalId: canonical.terminalId,
+        })
+      }
+      markTerminalDelivered(STATE_DIR, acknowledgement.dispatchId)
+    }
     liveness.lastDispatchProgressAt = Date.now()
   }
   for (const [dispatchId, acknowledgement] of Object.entries(state.pendingAcks || {})) {
@@ -925,7 +1011,22 @@ function baseEvent(state, dispatch, kind, body) {
   }
   const hash = eventHash(unsigned)
   return {
-    event: { protocolVersion: PROTOCOL, dispatchId: dispatch.id, messageId: dispatch.messageId, eventId: unsigned.eventId, sequence, kind, body, previousHash, eventHash: hash, occurredAt },
+    event: {
+      protocolVersion: PROTOCOL,
+      dispatchId: dispatch.id,
+      messageId: dispatch.messageId,
+      eventId: unsigned.eventId,
+      sequence,
+      kind,
+      body,
+      previousHash,
+      eventHash: hash,
+      occurredAt,
+      // Blocker 1: fence authorization must be signed. Present the current
+      // ownership epoch inside the signed event body; the server never
+      // authorizes from the unsigned `x-helm-link-fencing-token` header.
+      deliveryFencingToken: Number(state.fencingToken || 0),
+    },
     nextState: { sequence, lastHash: hash },
   }
 }
@@ -1081,6 +1182,19 @@ async function runLoop() {
   try {
     await acquireBindingFence(state)
     recoverAmbiguousInvocations(STATE_DIR, state, listInvocationClaims(STATE_DIR))
+    // Blocker 3: a connector restart must converge on delivery without
+    // re-executing anything. Flush any pending terminal outbox row (ack or
+    // recovery) before the acquisition loop opens the door to a new
+    // dispatch.
+    try {
+      await flushPendingAcks(state, {
+        lastPollCompletedAt: 0, lastDispatchProgressAt: 0,
+        activeDispatchId: null, queueDepth: 0,
+      })
+    } catch (error) {
+      if (isTerminalConnectorError(error)) throw error
+      console.error(`[helm-link] startup flush failed: ${error.message}`)
+    }
     await runConnectorLoops(state)
   } catch (error) {
     throw mapTerminalConnectorError(error, state)

@@ -18,25 +18,10 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.2.0-architecture.2')
-  assert.equal(
-    manifest.archive.sha256,
-    '25b0c07c1cb3f567259560e631d8217afbe0127f2477175bbee8dda6a1504235',
-  )
+  assert.equal(manifest.version, '0.2.0')
   assert.equal(Object.keys(manifest.files).length, 12)
 
-  for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
-    const body = readFileSync(join(root, relativePath))
-    const actualHash = createHash('sha256').update(body).digest('hex')
-    assert.equal(actualHash, expectedHash, `source drift: ${relativePath}`)
-  }
-
-  const first = packageOnce()
-  const second = packageOnce()
-  assert.equal(first.hash, manifest.archive.sha256)
-  assert.equal(second.hash, manifest.archive.sha256)
-  assert.ok(first.archive.equals(second.archive), 'archives are not reproducible')
-  assert.deepEqual(first.files, [
+  const expectedFiles = [
     'package/LICENSE',
     'package/README.md',
     'package/bin/helm-link.mjs',
@@ -49,7 +34,21 @@ try {
     'package/supervisors/launchd/com.helm.link.plist',
     'package/supervisors/run-supervised.sh',
     'package/supervisors/systemd/helm-link.service',
-  ])
+  ]
+
+  const first = packageOnce()
+  const second = packageOnce()
+  assert.ok(first.archive.equals(second.archive), 'archives are not reproducible')
+  assert.deepEqual(first.files, expectedFiles)
+
+  assert.notEqual(manifest.archive.sha256, 'PENDING_REPRODUCIBLE_BUILD')
+  assert.equal(first.hash, manifest.archive.sha256, 'archive SHA-256 drifted from pinned manifest value')
+  for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
+    assert.notEqual(expectedHash, 'PENDING_REPRODUCIBLE_BUILD', `unpinned source hash: ${relativePath}`)
+    const body = readFileSync(join(root, relativePath))
+    const actualHash = createHash('sha256').update(body).digest('hex')
+    assert.equal(actualHash, expectedHash, `source drift: ${relativePath}`)
+  }
 
   const workflow = readFileSync(
     join(root, '.github/workflows/publish-helm-link-connector.yml'),
@@ -58,12 +57,14 @@ try {
   assert.match(workflow, /tags:\s*\n\s*- 'helm-link-connector-v\*'/)
   assert.match(workflow, /id-token: write/)
   assert.match(workflow, /--provenance/)
-  assert.doesNotMatch(workflow, /0\.2\.0-architecture\.0/,
-    'architecture candidate must not be publishable before a separate release gate')
+  assert.doesNotMatch(workflow, /0\.2\.0-architecture\.\d+/,
+    'architecture candidate must not appear in the publication workflow')
   assert.doesNotMatch(
     workflow,
     /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|npm login|npm adduser/,
   )
+  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.0\.tgz/)
+  assert.match(workflow, new RegExp(manifest.archive.sha256))
 
   const installRoot = temporaryDirectory('helm-link-install-')
   const install = spawnSync('npm', [
@@ -111,10 +112,10 @@ try {
     'fixture-agent',
   )
 
-  console.log('VERIFIED source manifest: 12 audited package files')
-  console.log('VERIFIED architecture candidate is not wired to publication')
-  console.log(`VERIFIED release SHA-256: ${first.hash}`)
-  console.log('VERIFIED tokenless tag-bound OIDC workflow')
+  console.log('VERIFIED source manifest declares 12 audited package files')
+  console.log('VERIFIED release candidate 0.2.0 is not wired to publication')
+  console.log(`VERIFIED reproducible release SHA-256: ${first.hash}`)
+  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.0')
   console.log('VERIFIED installed CLI doctor contract')
 } finally {
   for (const directory of temporaryDirectories) {

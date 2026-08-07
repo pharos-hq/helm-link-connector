@@ -56,6 +56,9 @@ export function recordTerminal(root, input) {
     state: input.state,
     terminalCode: input.terminalCode ?? null,
     terminalSummary: String(input.terminalSummary || '').slice(0, 1000),
+    // Blocker 3: the canonical server terminal identity is recorded locally so
+    // a restart can send a receipt without recomputing anything.
+    terminalId: input.terminalId ? assertId(input.terminalId) : null,
     terminalAt: input.terminalAt || new Date().toISOString(),
   }
   const stored = exclusiveJson(terminalRecordPath(root, record.dispatchId), record)

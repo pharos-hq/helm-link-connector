@@ -7,13 +7,14 @@ OpenClaw agent to Helm Link.
 
 Helm generates a private connection command pinned to an exact public package
 version. Never replace that version with `latest`, reuse an expired connection
-code, or paste or screenshot the command. Version `0.1.9` is eligible for
-publication only through the repository's tag-bound GitHub OIDC workflow with
-npm provenance.
+code, or paste or screenshot the command. Version `0.2.0` is the current
+release candidate and is eligible for publication only through the
+repository's tag-bound GitHub OIDC workflow with npm provenance after an
+explicit release authorization gate.
 
-The `0.2.0-architecture.2` source is an unpublished review candidate. It is
-intentionally absent from the tag-bound publication workflow and must not be
-installed on a live binding before a separate staging release gate.
+The `0.2.0` archive is prepared but the tag-bound publish workflow remains
+inert; the archive must not be installed on a live binding before that
+separate staging release gate.
 
 The deterministic CI artifact has an exact SHA-256 in `SHA256SUMS`, but it is
 not the customer installation channel. Current Ubuntu VM and Node 22 container
@@ -22,7 +23,7 @@ hosted round trip. Follow `docs/HELM_LINK_SUPERVISED_PILOT_RUNBOOK.md` for the
 actual-custody gate.
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.1.9' doctor --agent your-openclaw-agent-id
+npx --yes '@pharos-hq/helm-link-connector@0.2.0' doctor --agent your-openclaw-agent-id
 ```
 
 Connection codes are intentionally omitted from documentation. Generate the
@@ -48,8 +49,8 @@ For an already paired Mac, install supervision without replacing the binding,
 key, transcript, or local state:
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.1.9' install-service
-npx --yes '@pharos-hq/helm-link-connector@0.1.9' service-status
+npx --yes '@pharos-hq/helm-link-connector@0.2.0' install-service
+npx --yes '@pharos-hq/helm-link-connector@0.2.0' service-status
 ```
 
 ## Supervisor templates
