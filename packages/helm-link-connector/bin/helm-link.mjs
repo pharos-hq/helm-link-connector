@@ -1078,9 +1078,22 @@ async function runLoop() {
   const state = loadState()
   if (!state) throw new Error('No connector state. Run connect first.')
   migrateProcessedLedger(STATE_DIR, state)
-  await acquireBindingFence(state)
-  recoverAmbiguousInvocations(STATE_DIR, state, listInvocationClaims(STATE_DIR))
-  await runConnectorLoops(state)
+  try {
+    await acquireBindingFence(state)
+    recoverAmbiguousInvocations(STATE_DIR, state, listInvocationClaims(STATE_DIR))
+    await runConnectorLoops(state)
+  } catch (error) {
+    throw mapTerminalConnectorError(error, state)
+  }
+}
+
+export function mapTerminalConnectorError(error, state, { persist = saveState } = {}) {
+  if (!isTerminalConnectorError(error)) return error
+  state.status = 'revoked'
+  state.revokedAt = state.revokedAt || new Date().toISOString()
+  persist(state)
+  error.exitCode = 75
+  return error
 }
 
 export async function runConnectorLoops(state, options = {}) {
@@ -1354,6 +1367,6 @@ if (invokedDirectly) {
     else usage(2)
   } catch (error) {
     console.error(error.message)
-    process.exit(1)
+    process.exit(Number.isInteger(error.exitCode) ? error.exitCode : 1)
   }
 }
