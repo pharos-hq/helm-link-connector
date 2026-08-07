@@ -9,10 +9,15 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  convergeStartupTerminals,
   postCommitTerminal,
   postTerminalReceipt,
   prepareTerminalDelivery,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
+import {
+  claimInvocation,
+  listInvocationClaims,
+} from '../packages/helm-link-connector/lib/invocation-claims.mjs'
 import {
   markTerminalDelivered,
   pendingTerminalOutbox,
@@ -242,9 +247,120 @@ try {
   }
 }
 
+// A restart after the server committed /ack but before the HTTP response was
+// observed must replay the durable acknowledgement first. It must not rewrite
+// that intent as an ambiguous recovery, and a transient convergence failure
+// must leave the acquisition loop closed with the original intent intact.
+{
+  const lostAckRoot = mkdtempSync(join(tmpdir(), 'helm-link-lost-ack-'))
+  try {
+    const lostAckDispatchId = 'dispatch-lost-ack-response'
+    const lostAckInvocationId = 'invocation-lost-ack-response'
+    const lostAckTerminalId = 'terminal-lost-ack-canonical'
+    claimInvocation(lostAckRoot, {
+      dispatchId: lostAckDispatchId,
+      bindingId: state.bindingId,
+      invocationId: lostAckInvocationId,
+      fencingToken: state.fencingToken,
+    })
+    writeTerminalOutbox(lostAckRoot, {
+      protocolVersion: 'helm-link.longpoll.v1',
+      dispatchId: lostAckDispatchId,
+      invocationId: lostAckInvocationId,
+      invocationFencingToken: state.fencingToken,
+      deliveryFencingToken: state.fencingToken,
+      state: 'completed',
+      terminalCode: null,
+      terminalSummary: 'Canonical completion survived a lost acknowledgement response.',
+    })
+
+    const paths = []
+    await convergeStartupTerminals(
+      state,
+      listInvocationClaims(lostAckRoot),
+      { lastDispatchProgressAt: 0 },
+      {
+        root: lostAckRoot,
+        postImpl: async (_state, path, body) => {
+          paths.push(path)
+          if (path === '/api/helm-link/connector/ack') {
+            assert.equal(body.recovery, undefined,
+              'lost acknowledgement intent must not be rewritten as recovery')
+            return {
+              ok: true,
+              duplicate: true,
+              terminalId: lostAckTerminalId,
+              canonical: {
+                state: 'completed',
+                terminalCode: null,
+                terminalSummary: body.terminalSummary,
+              },
+            }
+          }
+          if (path === '/api/helm-link/connector/receipts') {
+            assert.equal(body.terminalId, lostAckTerminalId)
+            return { delivered: true, duplicate: false, attemptCount: 1 }
+          }
+          throw new Error(`unexpected startup convergence path ${path}`)
+        },
+      },
+    )
+    assert.deepEqual(paths, [
+      '/api/helm-link/connector/ack',
+      '/api/helm-link/connector/receipts',
+    ])
+    assert.equal(readTerminalRecord(lostAckRoot, lostAckDispatchId)?.state, 'completed')
+    assert.equal(readTerminalRecord(lostAckRoot, lostAckDispatchId)?.terminalId, lostAckTerminalId)
+    assert.equal(pendingTerminalOutbox(lostAckRoot).length, 0)
+  } finally {
+    rmSync(lostAckRoot, { recursive: true, force: true })
+  }
+
+  const blockedRoot = mkdtempSync(join(tmpdir(), 'helm-link-lost-ack-blocked-'))
+  try {
+    const blockedDispatchId = 'dispatch-lost-ack-blocked'
+    const blockedInvocationId = 'invocation-lost-ack-blocked'
+    claimInvocation(blockedRoot, {
+      dispatchId: blockedDispatchId,
+      bindingId: state.bindingId,
+      invocationId: blockedInvocationId,
+      fencingToken: state.fencingToken,
+    })
+    writeTerminalOutbox(blockedRoot, {
+      protocolVersion: 'helm-link.longpoll.v1',
+      dispatchId: blockedDispatchId,
+      invocationId: blockedInvocationId,
+      invocationFencingToken: state.fencingToken,
+      deliveryFencingToken: state.fencingToken,
+      state: 'completed',
+      terminalCode: null,
+      terminalSummary: 'Pending acknowledgement remains durable while transport is unavailable.',
+    })
+    await assert.rejects(
+      convergeStartupTerminals(
+        state,
+        listInvocationClaims(blockedRoot),
+        { lastDispatchProgressAt: 0 },
+        {
+          root: blockedRoot,
+          postImpl: async () => { throw new Error('ack transport unavailable') },
+        },
+      ),
+      /transport unavailable/,
+    )
+    assert.equal(readTerminalRecord(blockedRoot, blockedDispatchId), null,
+      'failed acknowledgement convergence must not synthesize an ambiguous terminal')
+    assert.equal(pendingTerminalOutbox(blockedRoot)[0]?.recovery, undefined,
+      'the original acknowledgement intent must remain intact for retry')
+  } finally {
+    rmSync(blockedRoot, { recursive: true, force: true })
+  }
+}
+
 console.log('VERIFIED acknowledgement intent is durable on disk before the ack HTTP send')
 console.log('VERIFIED connector records the canonical arbitrated terminal, never a conflicting locally-authored one')
 console.log('VERIFIED missing canonical terminal identity fails closed and preserves delivery intent')
 console.log('VERIFIED a lost receipt response retries only the receipt; ack is never re-sent')
 console.log('VERIFIED recovery outbox rows are sent via /recoveries and closed with the same signed receipt')
 console.log('VERIFIED duplicate receipts never execute work; the durable invocation claim blocks any re-spawn')
+console.log('VERIFIED a lost acknowledgement response replays ack before recovery and blocks startup on transport failure')

@@ -609,11 +609,14 @@ export async function postTerminalReceipt(state, { dispatchId, terminalId }, { p
   })
 }
 
-async function flushPendingAcks(state, liveness) {
-  for (const acknowledgement of pendingTerminalOutbox(STATE_DIR)) {
+export async function flushPendingAcks(state, liveness, {
+  root = STATE_DIR,
+  postImpl = postJson,
+} = {}) {
+  for (const acknowledgement of pendingTerminalOutbox(root)) {
     const deliverable = prepareTerminalDelivery(state, acknowledgement)
     if (acknowledgement.recovery) {
-      const recoveryResponse = await postJson(state, '/api/helm-link/connector/recoveries', deliverable)
+      const recoveryResponse = await postImpl(state, '/api/helm-link/connector/recoveries', deliverable)
       // The recovery RPC creates the outbox row on the server; the same
       // explicit receipt closes it out so no relevant outbox row lingers.
       if (recoveryResponse?.ok === false
@@ -624,11 +627,11 @@ async function flushPendingAcks(state, liveness) {
       await postTerminalReceipt(state, {
         dispatchId: acknowledgement.dispatchId,
         terminalId: recoveryResponse.terminalId,
-      })
-      markTerminalDelivered(STATE_DIR, acknowledgement.dispatchId)
+      }, { postImpl })
+      markTerminalDelivered(root, acknowledgement.dispatchId)
     } else {
-      const canonical = await postCommitTerminal(state, deliverable)
-      recordTerminal(STATE_DIR, {
+      const canonical = await postCommitTerminal(state, deliverable, { postImpl })
+      recordTerminal(root, {
         dispatchId: acknowledgement.dispatchId,
         bindingId: state.bindingId,
         invocationId: deliverable.invocationId ?? null,
@@ -642,19 +645,35 @@ async function flushPendingAcks(state, liveness) {
         await postTerminalReceipt(state, {
           dispatchId: acknowledgement.dispatchId,
           terminalId: canonical.terminalId,
-        })
+        }, { postImpl })
       }
-      markTerminalDelivered(STATE_DIR, acknowledgement.dispatchId)
+      markTerminalDelivered(root, acknowledgement.dispatchId)
     }
     liveness.lastDispatchProgressAt = Date.now()
   }
   for (const [dispatchId, acknowledgement] of Object.entries(state.pendingAcks || {})) {
-    await postJson(state, '/api/helm-link/connector/ack', acknowledgement)
+    await postImpl(state, '/api/helm-link/connector/ack', acknowledgement)
     delete state.pendingAcks[dispatchId]
     state.processedDispatchIds = [dispatchId, ...state.processedDispatchIds.filter((id) => id !== dispatchId)].slice(0, LEDGER_MAX)
     liveness.lastDispatchProgressAt = Date.now()
     saveState(state)
   }
+}
+
+export async function convergeStartupTerminals(state, claims, liveness, options = {}) {
+  const root = options.root ?? STATE_DIR
+  // A durable acknowledgement intent is stronger evidence than a bare claim:
+  // it proves execution reached the terminal-delivery boundary. Replay that
+  // idempotent acknowledgement first so a lost HTTP response converges on the
+  // server's canonical terminal instead of being overwritten as an ambiguous
+  // recovery.
+  await flushPendingAcks(state, liveness, { ...options, root })
+
+  // Only claims that still have neither a local terminal nor a pending
+  // acknowledgement are genuinely ambiguous. They become absorbing
+  // no-replay recovery terminals, then their recovery outbox is flushed.
+  recoverAmbiguousInvocations(root, state, claims)
+  await flushPendingAcks(state, liveness, { ...options, root })
 }
 
 export function prepareTerminalDelivery(state, acknowledgement) {
@@ -1181,20 +1200,18 @@ async function runLoop() {
   migrateProcessedLedger(STATE_DIR, state)
   try {
     await acquireBindingFence(state)
-    recoverAmbiguousInvocations(STATE_DIR, state, listInvocationClaims(STATE_DIR))
-    // Blocker 3: a connector restart must converge on delivery without
-    // re-executing anything. Flush any pending terminal outbox row (ack or
-    // recovery) before the acquisition loop opens the door to a new
-    // dispatch.
-    try {
-      await flushPendingAcks(state, {
+    // A connector restart must converge durable terminal intent before it may
+    // acquire new work. Failure is terminal for this process attempt: the
+    // supervisor can retry, but the acquisition loop never opens while a
+    // terminal boundary is unresolved.
+    await convergeStartupTerminals(
+      state,
+      listInvocationClaims(STATE_DIR),
+      {
         lastPollCompletedAt: 0, lastDispatchProgressAt: 0,
         activeDispatchId: null, queueDepth: 0,
-      })
-    } catch (error) {
-      if (isTerminalConnectorError(error)) throw error
-      console.error(`[helm-link] startup flush failed: ${error.message}`)
-    }
+      },
+    )
     await runConnectorLoops(state)
   } catch (error) {
     throw mapTerminalConnectorError(error, state)

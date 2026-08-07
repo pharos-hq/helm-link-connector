@@ -14,7 +14,7 @@ limited to the 12 files under `packages/helm-link-connector/`.
 - npm publication uses GitHub OIDC trusted publishing with provenance.
 - No npm token is accepted by the release workflow.
 - The deterministic `0.2.0` archive SHA-256 is
-  `a49b303cadd139ac7668ebb57c974fd5ebbdd8fb0c96b4d6984ec8229a822b29`.
+  `632a596ee5412d5d2d0350a7221cfc63ed75cf2611a9554dff4808bd15a4d5a0`.
   The tag-bound workflow refuses to publish if a clean rebuild differs.
 - `SOURCE_MANIFEST.json` pins every executable package source file.
 - CI rejects source drift, archive drift, unexpected package contents, and
