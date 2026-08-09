@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      EXPECTED_SHA256: 632a596ee5412d5d2d0350a7221cfc63ed75cf2611a9554dff4808bd15a4d5a0
+      EXPECTED_SHA256: 5a2e286ac764742f51ab786e28ef4f2c98cf0f3918799528466d1e7fc33e6e87
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -59,3 +59,13 @@ jobs:
           test "$version" = '0.2.0'
           test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.2.0'
           npm view '@pharos-hq/helm-link-connector@0.2.0' dist.integrity dist.shasum dist.attestations --json
+      - name: Verify exact cold-cache registry install
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_root="$(mktemp -d)"
+          cache_root="$(mktemp -d)"
+          npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "$cache_root" --prefix "$install_root" '@pharos-hq/helm-link-connector@0.2.0'
+          HELM_LINK_STATE_DIR="$install_root/state" \
+          HELM_LINK_OPENCLAW_BIN="$GITHUB_WORKSPACE/tests/fixtures/fake-openclaw.mjs" \
+            "$install_root/node_modules/.bin/helm-link" doctor --agent fixture-agent

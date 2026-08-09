@@ -44,6 +44,7 @@ Commands:
   doctor [--agent <id>]
   connect --server <url> --code <code> --agent <openclaw-agent-id> [--host-label <label>] [--install-service]
   install-service
+  uninstall-service
   service-status
   run
   status
@@ -467,13 +468,38 @@ export function installService({ platformName = platform() } = {}) {
   return { installed: true, label: SERVICE_LABEL, plist: paths.plist, version: VERSION }
 }
 
+export function uninstallService({ platformName = platform() } = {}) {
+  if (platformName !== 'darwin') {
+    throw new Error('uninstall-service currently supports macOS launchd only; remove the packaged systemd/container supervisor on that host.')
+  }
+  const paths = servicePaths()
+  const target = `gui/${process.getuid()}/${SERVICE_LABEL}`
+  runLaunchctl(['bootout', target], { allowFailure: true })
+  if (existsSync(paths.plist)) rmSync(paths.plist)
+  if (existsSync(paths.runtimeDir)) rmSync(paths.runtimeDir, { recursive: true, force: true })
+  return { uninstalled: true, label: SERVICE_LABEL, plist: paths.plist, version: VERSION }
+}
+
 function serviceStatus() {
   if (platform() !== 'darwin') throw new Error('service-status currently supports macOS launchd only.')
+  const state = loadState()
+  if (!state) {
+    console.log(JSON.stringify({
+      label: SERVICE_LABEL,
+      installed: false,
+      connected: false,
+      stateFile: STATE_FILE,
+      version: VERSION,
+    }, null, 2))
+    return
+  }
   const target = `gui/${process.getuid()}/${SERVICE_LABEL}`
   const result = runLaunchctl(['print', target], { allowFailure: true })
   console.log(JSON.stringify({
     label: SERVICE_LABEL,
     installed: result.status === 0,
+    connected: state.status === 'paired',
+    status: state.status || 'unknown',
     stateFile: STATE_FILE,
     version: VERSION,
   }, null, 2))
@@ -1491,6 +1517,7 @@ if (invokedDirectly) {
     if (cmd === 'doctor') await doctor(args)
     else if (cmd === 'connect') await connect(args)
     else if (cmd === 'install-service') console.log(JSON.stringify(installService(), null, 2))
+    else if (cmd === 'uninstall-service') console.log(JSON.stringify(uninstallService(), null, 2))
     else if (cmd === 'service-status') serviceStatus()
     else if (cmd === 'run') await runLoop()
     else if (cmd === 'status') await status()

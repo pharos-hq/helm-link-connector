@@ -51,6 +51,7 @@ key, transcript, or local state:
 ```bash
 npx --yes '@pharos-hq/helm-link-connector@0.2.0' install-service
 npx --yes '@pharos-hq/helm-link-connector@0.2.0' service-status
+npx --yes '@pharos-hq/helm-link-connector@0.2.0' uninstall-service
 ```
 
 ## Supervisor templates
