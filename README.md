@@ -5,7 +5,7 @@ Canonical public source and release boundary for
 
 The connector runs on a customer's trusted OpenClaw host and communicates with
 Pharos Helm over outbound HTTPS. The executable package surface is intentionally
-limited to the eight files under `packages/helm-link-connector/`.
+limited to the 12 files under `packages/helm-link-connector/`.
 
 ## Supply-chain controls
 
@@ -13,8 +13,9 @@ limited to the eight files under `packages/helm-link-connector/`.
   `helm-link-connector-v<package-version>`.
 - npm publication uses GitHub OIDC trusted publishing with provenance.
 - No npm token is accepted by the release workflow.
-- The deterministic `0.1.9` archive must have SHA-256
-  `70a4095f060bf61d44e798d666f73d0805cfe27b217085fad9995d47ace64166`.
+- The deterministic `0.2.0` archive SHA-256 is
+  `5a2e286ac764742f51ab786e28ef4f2c98cf0f3918799528466d1e7fc33e6e87`.
+  The tag-bound workflow refuses to publish if a clean rebuild differs.
 - `SOURCE_MANIFEST.json` pins every executable package source file.
 - CI rejects source drift, archive drift, unexpected package contents, and
   unpinned release actions.
@@ -44,5 +45,5 @@ credential.
 The public, credential-free package check is:
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.1.9' doctor --agent your-openclaw-agent-id
+npx --yes '@pharos-hq/helm-link-connector@0.2.0' doctor --agent your-openclaw-agent-id
 ```

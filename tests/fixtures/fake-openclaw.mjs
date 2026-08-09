@@ -53,6 +53,18 @@ if (command === 'agent') {
     await new Promise((resolve) => setTimeout(resolve, 10000))
     process.exit(0)
   }
+  if (scenario === 'stdout-overflow') {
+    process.stdout.write('x'.repeat(4096))
+    await new Promise((resolve) => setTimeout(resolve, 10000))
+  }
+  if (scenario === 'stderr-overflow') {
+    process.stderr.write('x'.repeat(4096))
+    await new Promise((resolve) => setTimeout(resolve, 10000))
+  }
+  if (scenario === 'ignore-sigterm') {
+    process.on('SIGTERM', () => {})
+    await new Promise(() => setInterval(() => {}, 1000))
+  }
 }
 
 console.error(`unsupported fake-openclaw command: ${process.argv.slice(2).join(' ')}`)

@@ -21,14 +21,14 @@ process.env.HELM_LINK_LAUNCH_AGENTS_DIR = launchAgents
 process.env.HELM_LINK_LAUNCHCTL_BIN = fakeLaunchctl
 process.env.HELM_LINK_OPENCLAW_BIN = fakeOpenClaw
 
-const { installService } = await import('../packages/helm-link-connector/bin/helm-link.mjs')
+const { installService, uninstallService } = await import('../packages/helm-link-connector/bin/helm-link.mjs')
 mkdirSync(stateDir, { recursive: true, mode: 0o700 })
 writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ status: 'paired' }), { mode: 0o600 })
 
 const first = installService({ platformName: 'darwin' })
 const second = installService({ platformName: 'darwin' })
 assert.equal(first.installed, true)
-assert.equal(second.version, '0.1.9')
+assert.equal(second.version, '0.2.0')
 
 const plist = readFileSync(first.plist, 'utf8')
 assert.match(plist, /<key>RunAtLoad<\/key><true\/>/)
@@ -51,4 +51,10 @@ assert.match(calls, /bootstrap gui\/\d+ .*com\.pharos\.helm-link\.plist/)
 assert.match(calls, /enable gui\/\d+\/com\.pharos\.helm-link/)
 assert.match(calls, /kickstart -k gui\/\d+\/com\.pharos\.helm-link/)
 
-console.log('VERIFIED idempotent launchd install, RunAtLoad, and transient crash recovery contract')
+const uninstall = uninstallService({ platformName: 'darwin' })
+assert.equal(uninstall.uninstalled, true)
+
+const finalCalls = readFileSync(launchctlLog, 'utf8')
+assert.match(finalCalls, /bootout gui\/\d+\/com\.pharos\.helm-link/)
+
+console.log('VERIFIED idempotent launchd install, uninstall, RunAtLoad, and transient crash recovery contract')

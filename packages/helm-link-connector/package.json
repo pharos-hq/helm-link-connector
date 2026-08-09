@@ -1,6 +1,6 @@
 {
   "name": "@pharos-hq/helm-link-connector",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Host-neutral outbound HTTPS Helm Link connector for bring-your-own OpenClaw agents.",
   "type": "module",
   "bin": {
@@ -11,6 +11,7 @@
   },
   "files": [
     "bin",
+    "lib",
     "supervisors",
     "README.md",
     "LICENSE"

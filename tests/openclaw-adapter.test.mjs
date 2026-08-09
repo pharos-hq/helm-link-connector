@@ -4,14 +4,22 @@ import assert from 'node:assert/strict'
 import { generateKeyPairSync } from 'node:crypto'
 import { chmodSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import {
   advisoryArgs,
+  operationalArgs,
+  cancelGatewayAgentRun,
   extractStructuredModel,
   extractStructuredText,
   buildLaunchdPlist,
   deriveLivenessPresence,
+  deriveTwoAxisState,
   postJson,
   runOpenClawAdvisory,
+  registerInvocationClaim,
+  acquireBindingFence,
+  runBoundedCleanup,
 } from '../packages/helm-link-connector/bin/helm-link.mjs'
 
 const plist = buildLaunchdPlist({
@@ -33,12 +41,34 @@ const root = resolve(import.meta.dirname, '..')
 const fixture = join(root, 'tests/fixtures/fake-openclaw.mjs')
 chmodSync(fixture, 0o755)
 
-const invocation = advisoryArgs('fixture-agent', 'binding-123', 'safe advisory text')
+const invocation = advisoryArgs('fixture-agent', 'binding-123', 'safe advisory text', { noToolsAttested: true })
 try {
   assert.ok(invocation.args.includes('--json'), 'agent invocation must require structured JSON')
 } finally {
   invocation.cleanup()
 }
+
+const operational = operationalArgs('fixture-agent', 'binding-123',
+  '00000000-0000-4000-8000-000000000099', 'durable work', {
+    kind: 'run', capabilities: ['research'], deadlineMs: 30_000,
+    progress: 'durable-events', cancellation: 'terminal-no-replay', output: 'durable-terminal',
+  }, new Date(Date.now() + 60_000).toISOString())
+try {
+  assert.deepEqual(operational.args.slice(operational.args.indexOf('--run-id'), operational.args.indexOf('--run-id') + 2),
+    ['--run-id', '00000000-0000-4000-8000-000000000099'])
+  assert.ok(operational.args.includes('--queue-deadline-at'))
+  assert.ok(operational.args.includes('--execution-timeout-ms'))
+} finally { operational.cleanup() }
+
+const cancelResult = await cancelGatewayAgentRun({ runtimeAgentId: 'fixture-agent', bindingId: 'binding-123' },
+  '00000000-0000-4000-8000-000000000099', {
+    runImpl: async ({ args }) => {
+      assert.equal(args[2], 'agent.cancel')
+      assert.match(args[4], /00000000-0000-4000-8000-000000000099/)
+      return { terminationCause: 'completed', stdout: JSON.stringify({ cancelled: true, providerStarted: false }) }
+    },
+  })
+assert.deepEqual(cancelResult, { cancelled: true, providerStarted: false })
 
 const actualEnvelope = JSON.stringify({
   runId: '00000000-0000-4000-8000-000000000001',
@@ -61,6 +91,11 @@ assert.equal(structured.code, 0)
 assert.equal(structured.timedOut, false)
 assert.equal(extractStructuredText(structured.stdout), 'structured customer response')
 assert.equal(extractStructuredModel(structured.stdout), 'openai/gpt-fixture')
+assert.equal(structured.terminationCause, 'completed')
+assert.equal(structured.stdoutBytes, Buffer.byteLength(structured.stdout))
+assert.equal(structured.stderrBytes, 0)
+assert.equal(structured.stdoutTruncated, false)
+assert.equal(structured.stderrTruncated, false)
 
 const malformed = await runScenario('malformed')
 assert.equal(malformed.code, 0)
@@ -68,10 +103,36 @@ assert.equal(extractStructuredText(malformed.stdout), '')
 
 const nonzero = await runScenario('nonzero')
 assert.equal(nonzero.code, 9)
+assert.equal(nonzero.terminationCause, 'nonzero_exit')
 assert.equal(extractStructuredText(nonzero.stdout), '')
 
 const timedOut = await runScenario('timeout', 50)
 assert.equal(timedOut.timedOut, true)
+assert.equal(timedOut.terminationCause, 'parent_timeout')
+
+const stdoutOverflow = await runScenario('stdout-overflow', 2000, { outputLimit: 64 })
+assert.equal(stdoutOverflow.terminationCause, 'stdout_overflow')
+assert.equal(stdoutOverflow.stdoutTruncated, true)
+const stderrOverflow = await runScenario('stderr-overflow', 2000, { stderrLimit: 64 })
+assert.equal(stderrOverflow.terminationCause, 'stderr_overflow')
+assert.equal(stderrOverflow.stderrTruncated, true)
+
+const neverCloses = await runOpenClawAdvisory({
+  args: ['agent'], timeoutMs: 5, sigtermGraceMs: 5, closeTimeoutMs: 5,
+  spawnImpl: () => {
+    const child = new EventEmitter()
+    child.pid = 999
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => true
+    return child
+  },
+})
+assert.equal(neverCloses.terminationCause, 'close_timeout')
+await assert.rejects(runBoundedCleanup(() => new Promise(() => {}), 5),
+  (error) => error?.code === 'helm_link_cleanup_timeout')
+const spawnError = await runOpenClawAdvisory({ args: ['agent'], binary: '/definitely/missing/openclaw' })
+assert.equal(spawnError.terminationCause, 'spawn_error')
 assert.equal(extractStructuredText(timedOut.stdout), '')
 
 const zeroContent = await runScenario('zero-content')
@@ -93,6 +154,12 @@ assert.equal(deriveLivenessPresence({
   lastDispatchProgressAt: 0,
   pollStartedAt: 0,
 }, 90_001), 'degraded')
+assert.deepEqual(deriveTwoAxisState({ lastPollCompletedAt: 100_000, activeDispatchId: 'd', queueDepth: 2 }, 100_001), {
+  connectionHealth: 'available', workloadState: 'busy',
+})
+assert.deepEqual(deriveTwoAxisState({ lastPollCompletedAt: 1, activeDispatchId: null, queueDepth: 2 }, 100_000), {
+  connectionHealth: 'degraded', workloadState: 'queued',
+})
 
 const pair = generateKeyPairSync('ed25519')
 await assert.rejects(
@@ -107,6 +174,38 @@ await assert.rejects(
     }),
   }),
   (error) => error?.code === 'helm_link_request_timeout',
+)
+
+let registered = null
+await registerInvocationClaim({ bindingId: 'binding-fixture' }, {
+  dispatchId: 'dispatch-fixture',
+  invocationId: 'invocation-fixture',
+  fencingToken: 4,
+}, {
+  postImpl: async (_state, path, body) => {
+    registered = { path, body }
+    return { accepted: true }
+  },
+})
+assert.deepEqual(registered, {
+  path: '/api/helm-link/connector/claims',
+  body: {
+    protocolVersion: 'helm-link.longpoll.v1',
+    dispatchId: 'dispatch-fixture',
+    invocationId: 'invocation-fixture',
+    fencingToken: 4,
+  },
+})
+
+const fencedState = { fencingToken: 3 }
+assert.equal(await acquireBindingFence(fencedState, {
+  postImpl: async () => ({ fencingToken: 4, issuedAt: '2026-08-05T14:00:00.000Z' }),
+  persist: () => {},
+}), 4)
+assert.equal(fencedState.fencingToken, 4)
+await assert.rejects(
+  acquireBindingFence(fencedState, { postImpl: async () => ({ fencingToken: 4 }), persist: () => {} }),
+  /non-monotonic fencing token/,
 )
 await assert.rejects(
   postJson({
@@ -127,12 +226,17 @@ await assert.rejects(
 console.log('VERIFIED OpenClaw 2026.7.1 structured-output contract')
 console.log('VERIFIED malformed, non-zero, timeout, and zero-content fail closed')
 console.log('VERIFIED bounded HTTP headers/body and data-plane-derived presence')
+console.log('VERIFIED typed termination diagnostics and independent stdout/stderr counters')
+console.log('VERIFIED local claim is registered with server before spawn')
+console.log('VERIFIED connector acquires and persists monotonic fencing ownership')
+console.log('VERIFIED timeout, overflow, signal escalation, close, and cleanup bounds')
 
-async function runScenario(scenario, timeoutMs = 2000) {
+async function runScenario(scenario, timeoutMs = 2000, options = {}) {
   return runOpenClawAdvisory({
     binary: fixture,
     args: ['agent', '--agent', 'fixture-agent', '--message', 'fixture', '--json'],
     timeoutMs,
     env: { ...process.env, FAKE_OPENCLAW_SCENARIO: scenario },
+    ...options,
   })
 }

@@ -12,11 +12,25 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { homedir, platform, release, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { performance } from 'node:perf_hooks'
+import { createLifecycleJournal } from '../lib/lifecycle-journal.mjs'
+import { claimInvocation, listInvocationClaims, markInvocationStarted } from '../lib/invocation-claims.mjs'
+import {
+  markTerminalDelivered,
+  migrateProcessedLedger,
+  pendingTerminalOutbox,
+  readTerminalRecord,
+  recordTerminal,
+  recoverAmbiguousInvocations,
+  writeTerminalOutbox,
+} from '../lib/terminal-store.mjs'
+import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.1.9'
+const VERSION = '0.2.0'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
+const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
 const SERVICE_LABEL = 'com.pharos.helm-link'
 const LEDGER_MAX = 200
 const HTTP_REQUEST_TIMEOUT_MS = 20_000
@@ -30,6 +44,7 @@ Commands:
   doctor [--agent <id>]
   connect --server <url> --code <code> --agent <openclaw-agent-id> [--host-label <label>] [--install-service]
   install-service
+  uninstall-service
   service-status
   run
   status
@@ -137,14 +152,38 @@ function runtimeModelForAgent(agentId) {
   }
 }
 
-export function advisoryArgs(agentId, bindingId, text) {
+export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false } = {}) {
   if (DENIED.test(text)) throw new Error('Advisory-only Helm Link accepts chat, not tool or execution commands.')
+  if (classifyWorkloadText(text).lane !== 'chat') throw new Error('Operational work requires a durable Helm Link Run.')
+  if (!noToolsAttested) throw new Error('Chat lane requires a host-attested no-tools advisory agent.')
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-message-'))
   const file = join(dir, 'message.txt')
   writePrivate(file, text)
   return {
     args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-link:${bindingId}`, '--message-file', file, '--timeout', '120', '--json'],
+    cleanup() {
+      try { unlinkSync(file) } catch {}
+      try { rmSync(dir, { recursive: true, force: true }) } catch {}
+    },
+  }
+}
+
+export function operationalArgs(agentId, bindingId, dispatchId, text, contract, expiresAt) {
+  const run = validateRunContract(contract)
+  if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
+  const dir = mkdtempSync(join(tmpdir(), 'helm-link-run-'))
+  const file = join(dir, 'message.txt')
+  writePrivate(file, text)
+  const parsedExpiry = Date.parse(expiresAt)
+  const queueDeadlineAt = Number.isFinite(parsedExpiry) ? parsedExpiry : Date.now()
+  const queueRemainingMs = Math.max(0, queueDeadlineAt - Date.now())
+  return {
+    args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-run:${bindingId}:${dispatchId}`,
+      '--run-id', dispatchId, '--queue-deadline-at', String(queueDeadlineAt),
+      '--execution-timeout-ms', String(run.deadlineMs), '--message-file', file,
+      '--timeout', String(Math.ceil((run.deadlineMs + queueRemainingMs) / 1000)), '--json'],
+    timeoutMs: run.deadlineMs + queueRemainingMs + 5_000,
     cleanup() {
       try { unlinkSync(file) } catch {}
       try { rmSync(dir, { recursive: true, force: true }) } catch {}
@@ -192,6 +231,9 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
         'x-helm-link-nonce': nonce,
         'x-helm-link-body-sha256': hash,
         'x-helm-link-signature': signature,
+        ...(Number.isSafeInteger(state.fencingToken)
+          ? { 'x-helm-link-fencing-token': String(state.fencingToken) }
+          : {}),
       },
       body: raw,
       signal: controller.signal,
@@ -216,6 +258,14 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
     throw error
   }
   return json
+}
+
+// Cancellation is durable control traffic. Keep the call site distinct from
+// ordinary acquisition/presence/event traffic so the server can reserve an
+// independently governed budget for it. The server derives the traffic class
+// from the authenticated route; callers cannot promote arbitrary requests.
+export async function postControlJson(state, pathname, body, options = {}) {
+  return postJson(state, pathname, body, options)
 }
 
 async function doctor(args) {
@@ -288,6 +338,7 @@ async function connect(args) {
     processedDispatchIds: [],
     eventStateByDispatch: {},
     status: 'paired',
+    advisoryNoToolsAttested: args['advisory-no-tools-attested'] === true,
   })
   let service = null
   if (args['install-service']) service = installService()
@@ -417,13 +468,38 @@ export function installService({ platformName = platform() } = {}) {
   return { installed: true, label: SERVICE_LABEL, plist: paths.plist, version: VERSION }
 }
 
+export function uninstallService({ platformName = platform() } = {}) {
+  if (platformName !== 'darwin') {
+    throw new Error('uninstall-service currently supports macOS launchd only; remove the packaged systemd/container supervisor on that host.')
+  }
+  const paths = servicePaths()
+  const target = `gui/${process.getuid()}/${SERVICE_LABEL}`
+  runLaunchctl(['bootout', target], { allowFailure: true })
+  if (existsSync(paths.plist)) rmSync(paths.plist)
+  if (existsSync(paths.runtimeDir)) rmSync(paths.runtimeDir, { recursive: true, force: true })
+  return { uninstalled: true, label: SERVICE_LABEL, plist: paths.plist, version: VERSION }
+}
+
 function serviceStatus() {
   if (platform() !== 'darwin') throw new Error('service-status currently supports macOS launchd only.')
+  const state = loadState()
+  if (!state) {
+    console.log(JSON.stringify({
+      label: SERVICE_LABEL,
+      installed: false,
+      connected: false,
+      stateFile: STATE_FILE,
+      version: VERSION,
+    }, null, 2))
+    return
+  }
   const target = `gui/${process.getuid()}/${SERVICE_LABEL}`
   const result = runLaunchctl(['print', target], { allowFailure: true })
   console.log(JSON.stringify({
     label: SERVICE_LABEL,
     installed: result.status === 0,
+    connected: state.status === 'paired',
+    status: state.status || 'unknown',
     stateFile: STATE_FILE,
     version: VERSION,
   }, null, 2))
@@ -442,7 +518,20 @@ export function deriveLivenessPresence(liveness, nowMs = Date.now()) {
   return pollHung || dataPlaneStale ? 'degraded' : 'online'
 }
 
-async function presence(state, liveness, value = deriveLivenessPresence(liveness)) {
+export function deriveTwoAxisState(liveness, nowMs = Date.now()) {
+  const latestProgress = Math.max(liveness.lastPollCompletedAt || 0, liveness.lastDispatchProgressAt || 0)
+  const age = latestProgress ? nowMs - latestProgress : Number.POSITIVE_INFINITY
+  const connectionHealth = age < DATA_PLANE_STALE_MS
+    ? 'available'
+    : age < DATA_PLANE_STALE_MS * 3 ? 'degraded' : 'offline'
+  const workloadState = liveness.activeDispatchId
+    ? 'busy'
+    : Number(liveness.queueDepth || 0) > 0 ? 'queued' : 'idle'
+  return { connectionHealth, workloadState }
+}
+
+async function presence(state, liveness, value = deriveLivenessPresence(liveness), telemetry = {}) {
+  const axes = deriveTwoAxisState(liveness)
   return postJson(state, '/api/helm-link/connector/presence', {
     protocolVersion: PROTOCOL,
     presence: value,
@@ -450,9 +539,20 @@ async function presence(state, liveness, value = deriveLivenessPresence(liveness
     hostOs: `${platform()} ${release()}`,
     nodeVersion: process.version,
     connectorVersion: VERSION,
-    openclawVersion: openclawVersion(),
+    openclawVersion: telemetry.openclawVersion ?? null,
     compatibility: 'supported',
-    runtimeModel: runtimeModelForAgent(state.runtimeAgentId),
+    connectionHealth: axes.connectionHealth,
+    workloadState: axes.workloadState,
+    queueDepth: Number(liveness.queueDepth || 0),
+    // Blocker 1: fence authorization must be signed. Present the current
+    // ownership epoch inside the signed body; the server never authorizes
+    // from the unsigned `x-helm-link-fencing-token` header.
+    deliveryFencingToken: Number(state.fencingToken || 0),
+    functional: {
+      lastPollCompletedAt: liveness.lastPollCompletedAt ? new Date(liveness.lastPollCompletedAt).toISOString() : null,
+      lastDispatchProgressAt: liveness.lastDispatchProgressAt ? new Date(liveness.lastDispatchProgressAt).toISOString() : null,
+    },
+    runtimeModel: telemetry.runtimeModel ?? null,
     diagnostics: {
       openclaw: resolveOpenClaw(),
       dataPlane: value === 'online' ? 'healthy' : value,
@@ -466,19 +566,119 @@ async function presence(state, liveness, value = deriveLivenessPresence(liveness
 }
 
 async function acknowledgeTerminal(state, dispatch, acknowledgement, liveness) {
-  if (!state.pendingAcks) state.pendingAcks = {}
-  state.pendingAcks[dispatch.id] = acknowledgement
-  saveState(state)
-  await postJson(state, '/api/helm-link/connector/ack', acknowledgement)
-  delete state.pendingAcks[dispatch.id]
-  state.processedDispatchIds = [dispatch.id, ...state.processedDispatchIds.filter((id) => id !== dispatch.id)].slice(0, LEDGER_MAX)
+  const durableAck = {
+    ...acknowledgement,
+    invocationId: acknowledgement.invocationId || state.activeInvocationId || null,
+    invocationFencingToken: Number(state.fencingToken || 0),
+    deliveryFencingToken: Number(state.fencingToken || 0),
+  }
+  // Blocker 3, step 1: durably record terminal-delivery *intent* before any
+  // absorbing local terminal exists. If the server arbitrates cancellation
+  // over our completion, the canonical result the server returns will land
+  // in the local absorbing store — never a conflicting locally-authored one.
+  writeTerminalOutbox(STATE_DIR, durableAck)
+  // Blocker 2/3, step 2: post the ack. The server locks the run+dispatch and
+  // returns the canonical absorbing terminal (which may differ from what we
+  // requested if cancellation was already durable).
+  const canonical = await postCommitTerminal(state, durableAck)
+  // Step 3: durably record the canonical terminal locally.
+  recordTerminal(STATE_DIR, {
+    dispatchId: dispatch.id,
+    bindingId: state.bindingId,
+    invocationId: durableAck.invocationId,
+    invocationFencingToken: durableAck.invocationFencingToken,
+    state: canonical.state,
+    terminalCode: canonical.terminalCode,
+    terminalSummary: canonical.terminalSummary,
+    terminalId: canonical.terminalId,
+  })
+  if (canonical.terminalId) {
+    // Step 4/5: signed, fenced, idempotent receipt marks the server outbox
+    // row `delivered` and returns the delivered_at.
+    await postTerminalReceipt(state, {
+      dispatchId: dispatch.id,
+      terminalId: canonical.terminalId,
+    })
+  }
+  // Step 6: local delivery marker so restart-safe scanning skips it.
+  markTerminalDelivered(STATE_DIR, dispatch.id)
   liveness.lastDispatchProgressAt = Date.now()
   saveState(state)
 }
 
-async function flushPendingAcks(state, liveness) {
+export async function postCommitTerminal(state, durableAck, { postImpl = postJson } = {}) {
+  const response = await postImpl(state, '/api/helm-link/connector/ack', durableAck)
+  if (response?.ok === false) {
+    throw new Error('Terminal acknowledgement was not accepted by the server')
+  }
+  const canonical = response?.canonical ?? {}
+  if (typeof response?.terminalId !== 'string' || !response.terminalId) {
+    throw new Error('Terminal acknowledgement did not return a canonical terminal identity')
+  }
+  return {
+    ok: true,
+    duplicate: response?.duplicate === true,
+    arbitrated: response?.arbitrated === true,
+    terminalId: response?.terminalId ?? null,
+    state: canonical.state ?? durableAck.state,
+    terminalCode: canonical.terminalCode ?? durableAck.terminalCode,
+    terminalSummary: canonical.terminalSummary ?? durableAck.terminalSummary,
+  }
+}
+
+export async function postTerminalReceipt(state, { dispatchId, terminalId }, { postImpl = postJson } = {}) {
+  return postImpl(state, '/api/helm-link/connector/receipts', {
+    protocolVersion: PROTOCOL,
+    dispatchId,
+    terminalId,
+    deliveryFencingToken: Number(state.fencingToken || 0),
+  })
+}
+
+export async function flushPendingAcks(state, liveness, {
+  root = STATE_DIR,
+  postImpl = postJson,
+} = {}) {
+  for (const acknowledgement of pendingTerminalOutbox(root)) {
+    const deliverable = prepareTerminalDelivery(state, acknowledgement)
+    if (acknowledgement.recovery) {
+      const recoveryResponse = await postImpl(state, '/api/helm-link/connector/recoveries', deliverable)
+      // The recovery RPC creates the outbox row on the server; the same
+      // explicit receipt closes it out so no relevant outbox row lingers.
+      if (recoveryResponse?.ok === false
+          || typeof recoveryResponse?.terminalId !== 'string'
+          || !recoveryResponse.terminalId) {
+        throw new Error('Ambiguous-outcome recovery did not return a canonical terminal identity')
+      }
+      await postTerminalReceipt(state, {
+        dispatchId: acknowledgement.dispatchId,
+        terminalId: recoveryResponse.terminalId,
+      }, { postImpl })
+      markTerminalDelivered(root, acknowledgement.dispatchId)
+    } else {
+      const canonical = await postCommitTerminal(state, deliverable, { postImpl })
+      recordTerminal(root, {
+        dispatchId: acknowledgement.dispatchId,
+        bindingId: state.bindingId,
+        invocationId: deliverable.invocationId ?? null,
+        invocationFencingToken: Number(deliverable.invocationFencingToken || 0),
+        state: canonical.state,
+        terminalCode: canonical.terminalCode,
+        terminalSummary: canonical.terminalSummary,
+        terminalId: canonical.terminalId,
+      })
+      if (canonical.terminalId) {
+        await postTerminalReceipt(state, {
+          dispatchId: acknowledgement.dispatchId,
+          terminalId: canonical.terminalId,
+        }, { postImpl })
+      }
+      markTerminalDelivered(root, acknowledgement.dispatchId)
+    }
+    liveness.lastDispatchProgressAt = Date.now()
+  }
   for (const [dispatchId, acknowledgement] of Object.entries(state.pendingAcks || {})) {
-    await postJson(state, '/api/helm-link/connector/ack', acknowledgement)
+    await postImpl(state, '/api/helm-link/connector/ack', acknowledgement)
     delete state.pendingAcks[dispatchId]
     state.processedDispatchIds = [dispatchId, ...state.processedDispatchIds.filter((id) => id !== dispatchId)].slice(0, LEDGER_MAX)
     liveness.lastDispatchProgressAt = Date.now()
@@ -486,28 +686,170 @@ async function flushPendingAcks(state, liveness) {
   }
 }
 
-async function handleDispatch(state, dispatch, liveness) {
-  if (state.processedDispatchIds.includes(dispatch.id)) return
+export async function convergeStartupTerminals(state, claims, liveness, options = {}) {
+  const root = options.root ?? STATE_DIR
+  // A durable acknowledgement intent is stronger evidence than a bare claim:
+  // it proves execution reached the terminal-delivery boundary. Replay that
+  // idempotent acknowledgement first so a lost HTTP response converges on the
+  // server's canonical terminal instead of being overwritten as an ambiguous
+  // recovery.
+  await flushPendingAcks(state, liveness, { ...options, root })
+
+  // Only claims that still have neither a local terminal nor a pending
+  // acknowledgement are genuinely ambiguous. They become absorbing
+  // no-replay recovery terminals, then their recovery outbox is flushed.
+  recoverAmbiguousInvocations(root, state, claims)
+  await flushPendingAcks(state, liveness, { ...options, root })
+}
+
+export function prepareTerminalDelivery(state, acknowledgement) {
+  return {
+    ...acknowledgement,
+    deliveryFencingToken: Number(state.fencingToken || 0),
+  }
+}
+
+export function classifyCancellationTerminal(cancellation) {
+  const providerStarted = cancellation?.providerStarted === true
+  const confirmed = cancellation?.resolved === true && cancellation?.cancelled === true
+  const terminalCode = confirmed
+    ? providerStarted ? 'cancelled_during_execution' : 'cancelled_before_provider'
+    : 'execution_outcome_unknown'
+  const terminalSummary = confirmed
+    ? providerStarted
+      ? 'Run cancellation was confirmed after provider execution began.'
+      : 'Run cancellation was confirmed before provider execution began.'
+    : 'Cancellation raced a Gateway interruption; execution outcome is unknown and replay is forbidden.'
+  return { terminalCode, terminalSummary }
+}
+
+export async function settleCancellationAuthority(cancellation, {
+  timeoutMs = 7_500,
+  sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  if (cancellation?.requested !== true || cancellation.resolved === true) return cancellation
+  const deadline = Date.now() + timeoutMs
+  while (cancellation.resolved !== true && Date.now() < deadline) await sleepImpl(10)
+  return cancellation
+}
+
+function gatewayEnvelopeOutcome(stdout) {
+  try {
+    const value = JSON.parse(stdout)
+    return {
+      status: typeof value?.status === 'string' ? value.status : null,
+      summary: typeof value?.summary === 'string' ? value.summary.slice(0, 80) : null,
+      stopReason: typeof value?.stopReason === 'string' ? value.stopReason : null,
+      aborted: value?.result?.aborted === true || value?.result?.meta?.aborted === true,
+    }
+  } catch {
+    return { status: null, summary: null, stopReason: null, aborted: false }
+  }
+}
+
+export async function handleDispatch(state, dispatch, liveness) {
+  if (readTerminalRecord(STATE_DIR, dispatch.id)) return
   if (state.pendingAcks?.[dispatch.id]) {
     await flushPendingAcks(state, liveness)
     return
   }
-  const text = dispatch.payload?.text
-  const invocation = advisoryArgs(state.runtimeAgentId, state.bindingId, String(text))
+  const journal = createLifecycleJournal(LIFECYCLE_FILE)
+  const invocationId = randomUUID()
+  const claim = claimInvocation(STATE_DIR, {
+    dispatchId: dispatch.id,
+    bindingId: state.bindingId,
+    fencingToken: Number(state.fencingToken || 0),
+    invocationId,
+  })
+  journal('invocation_claimed', claim)
+  await registerInvocationClaim(state, claim)
+  journal('invocation_claim_registered', {
+    dispatchId: dispatch.id,
+    bindingId: state.bindingId,
+    invocationId,
+    fencingToken: claim.fencingToken,
+  })
+  const text = String(dispatch.payload?.text || '')
+  const lane = dispatch.payload?.kind === 'run' ? 'run' : 'chat'
+  const invocation = lane === 'run'
+    ? operationalArgs(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt)
+    : advisoryArgs(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
+  state.activeInvocationId = invocationId
   liveness.activeDispatchId = dispatch.id
+  liveness.activeGatewayRunId = dispatch.id
+  liveness.cancellation = null
   liveness.activeDispatchStartedAt = Date.now()
   try {
+    journal('dispatch_received', { dispatchId: dispatch.id, bindingId: state.bindingId })
     await postConnectorEvent(state, statusEvent(state, dispatch, 'working'))
     liveness.lastDispatchProgressAt = Date.now()
-    const result = await runOpenClawAdvisory({ args: invocation.args })
-    if (result.timedOut) {
-      const summary = 'OpenClaw advisory timed out; no customer content produced.'
+    const result = await runOpenClawAdvisory({
+      args: invocation.args,
+      timeoutMs: invocation.timeoutMs,
+      lifecycle: (kind, fields) => journal(kind, {
+        dispatchId: dispatch.id,
+        bindingId: state.bindingId,
+        ...fields,
+      }),
+      onSpawn: ({ pid, startedAt }) => markInvocationStarted(STATE_DIR, dispatch.id, {
+        invocationId,
+        bindingId: state.bindingId,
+        fencingToken: Number(state.fencingToken || 0),
+        pid,
+        startedAt,
+      }),
+    })
+    const envelope = gatewayEnvelopeOutcome(result.stdout)
+    journal('execution_process_settled', {
+      dispatchId: dispatch.id,
+      bindingId: state.bindingId,
+      gatewayRunId: liveness.activeGatewayRunId,
+      terminationCause: result.terminationCause,
+      exitCode: result.code ?? null,
+      signal: result.signal ?? null,
+      stdoutBytes: result.stdoutBytes ?? 0,
+      stderrBytes: result.stderrBytes ?? 0,
+      gatewayStatus: envelope.status,
+      gatewayStopReason: envelope.stopReason,
+      gatewayAborted: envelope.aborted,
+      cancellationRequested: liveness.cancellation?.requested === true,
+    })
+    // A durable cancellation request is authoritative even when the OpenClaw
+    // CLI exits zero with a structured `status=timeout, stopReason=aborted`
+    // envelope. Process exit zero means the RPC completed; it does not mean the
+    // agent Run completed successfully. Never let ordinary completion win once
+    // cancellation intent has crossed the durable Helm boundary.
+    if (liveness.cancellation?.requested === true) {
+      await settleCancellationAuthority(liveness.cancellation)
+      const { terminalCode, terminalSummary: summary } = classifyCancellationTerminal(liveness.cancellation)
+      journal('cancellation_terminal_selected', {
+        dispatchId: dispatch.id,
+        bindingId: state.bindingId,
+        gatewayRunId: liveness.activeGatewayRunId,
+        requestedAt: liveness.cancellation.requestedAt,
+        cancellationResolved: liveness.cancellation.resolved === true,
+        gatewayCancelled: liveness.cancellation.cancelled === true,
+        providerStarted: liveness.cancellation.providerStarted,
+        terminalCode,
+      })
       await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_timeout', terminalSummary: summary }, liveness)
-    } else if (result.code !== 0 || result.overflow) {
-      const summary = 'OpenClaw advisory failed; no customer content produced.'
+      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
+        state: 'failed', terminalCode, terminalSummary: summary }, liveness)
+      return
+    }
+    if (result.terminationCause !== 'completed') {
+      const terminalByCause = {
+        parent_timeout: ['openclaw_parent_timeout', 'OpenClaw advisory exceeded its parent deadline; no customer content produced.'],
+        stdout_overflow: ['openclaw_stdout_overflow', 'OpenClaw stdout exceeded its bound; no customer content produced.'],
+        stderr_overflow: ['openclaw_stderr_overflow', 'OpenClaw stderr exceeded its bound; no customer content produced.'],
+        signal_exit: ['openclaw_signal_exit', 'OpenClaw exited by signal; no customer content produced.'],
+        nonzero_exit: ['openclaw_nonzero_exit', 'OpenClaw exited nonzero; no customer content produced.'],
+        spawn_error: ['openclaw_spawn_error', 'OpenClaw could not be spawned; no customer content produced.'],
+        close_timeout: ['openclaw_close_timeout', 'OpenClaw did not close within its external bound; no customer content produced.'],
+      }
+      const [terminalCode, summary] = terminalByCause[result.terminationCause] || ['openclaw_failed', 'OpenClaw advisory failed; no customer content produced.']
       await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode: 'openclaw_failed', terminalSummary: summary }, liveness)
+      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode, terminalSummary: summary }, liveness)
     } else {
       // HFA-004 — extractText requires structured output; if OpenClaw
       // produced no parseable response frame the run is treated as a
@@ -534,10 +876,22 @@ async function handleDispatch(state, dispatch, liveness) {
       }
     }
   } finally {
-    invocation.cleanup()
+    await runBoundedCleanup(invocation.cleanup)
     liveness.activeDispatchId = null
+    liveness.activeGatewayRunId = null
+    liveness.cancellation = null
     liveness.activeDispatchStartedAt = null
+    delete state.activeInvocationId
   }
+}
+
+export async function registerInvocationClaim(state, claim, { postImpl = postJson } = {}) {
+  return postImpl(state, '/api/helm-link/connector/claims', {
+    protocolVersion: PROTOCOL,
+    dispatchId: claim.dispatchId,
+    invocationId: claim.invocationId,
+    fencingToken: claim.fencingToken,
+  })
 }
 
 export async function runOpenClawAdvisory({
@@ -545,40 +899,140 @@ export async function runOpenClawAdvisory({
   binary = resolveOpenClaw(),
   timeoutMs = 125000,
   env = process.env,
+  lifecycle = () => {},
+  onSpawn = () => {},
+  outputLimit = 1_000_000,
+  stderrLimit = 250_000,
+  sigtermGraceMs = 2_000,
+  closeTimeoutMs = 2_000,
+  spawnImpl = spawn,
 } = {}) {
   if (!Array.isArray(args)) throw new Error('OpenClaw advisory args are required.')
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, {
-      env: { ...env, NO_COLOR: '1' },
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    let stdout = ''
-    let timedOut = false
-    let overflow = false
-    const outputLimit = 1_000_000
-    const appendBounded = (current, chunk) => {
-      const next = current + chunk.toString()
-      if (Buffer.byteLength(next, 'utf8') <= outputLimit) return next
-      overflow = true
-      child.kill('SIGTERM')
-      return current
+    const startedMonotonicMs = performance.now()
+    const startedAt = new Date().toISOString()
+    let child
+    try {
+      child = spawnImpl(binary, args, {
+        env: { ...env, NO_COLOR: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      lifecycle('spawn_error', { errorCode: error?.code || null })
+      reject(error)
+      return
     }
-    child.stdout.on('data', (chunk) => { stdout = appendBounded(stdout, chunk) })
-    child.once('error', reject)
+    let stdout = ''
+    let stderr = ''
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let firstStdoutAt = null
+    let firstStderrAt = null
+    let timedOut = false
+    let stdoutTruncated = false
+    let stderrTruncated = false
+    let terminationCause = null
+    let timerIdentity = null
+    let settled = false
+    let runtimeTimer = null
     let forceTimer = null
-    const timer = setTimeout(() => {
-      timedOut = true
+    let closeTimer = null
+    lifecycle('spawned', { pid: child.pid || null, startedAt })
+    try {
+      onSpawn({ pid: child.pid || null, startedAt })
+    } catch (error) {
+      lifecycle('spawn_state_error', { pid: child.pid || null, errorCode: error?.code || null })
+      child.once('error', () => {})
+      child.kill('SIGKILL')
+      reject(error)
+      return
+    }
+    const appendBounded = (stream, current, chunk) => {
+      const bytes = Buffer.byteLength(chunk)
+      if (stream === 'stdout') {
+        stdoutBytes += bytes
+        if (!firstStdoutAt) firstStdoutAt = new Date().toISOString()
+      } else {
+        stderrBytes += bytes
+        if (!firstStderrAt) firstStderrAt = new Date().toISOString()
+      }
+      const retainedBytes = Buffer.byteLength(current, 'utf8')
+      const limit = stream === 'stdout' ? outputLimit : stderrLimit
+      const remaining = Math.max(0, limit - retainedBytes)
+      if (bytes <= remaining) return current + chunk.toString()
+      if (stream === 'stdout') stdoutTruncated = true
+      else stderrTruncated = true
+      terminate(stream === 'stdout' ? 'stdout_overflow' : 'stderr_overflow', `${stream}_limit`)
+      return current + chunk.subarray(0, remaining).toString()
+    }
+    child.stdout.on('data', (chunk) => { stdout = appendBounded('stdout', stdout, chunk) })
+    child.stderr.on('data', (chunk) => { stderr = appendBounded('stderr', stderr, chunk) })
+    const diagnostics = (code, signal, cause = terminationCause) => ({
+      code: code ?? (cause === 'completed' ? 0 : 1), signal, timedOut,
+      overflow: stdoutTruncated || stderrTruncated, stdout, stderr, stdoutBytes, stderrBytes,
+      stdoutTruncated, stderrTruncated, firstStdoutAt, firstStderrAt, startedAt,
+      durationMs: Number((performance.now() - startedMonotonicMs).toFixed(3)),
+      timerIdentity, terminationCause: cause,
+    })
+    const settle = (code, signal, cause = terminationCause) => {
+      if (settled) return
+      settled = true
+      clearTimeout(runtimeTimer)
+      clearTimeout(forceTimer)
+      clearTimeout(closeTimer)
+      const result = diagnostics(code, signal, cause)
+      lifecycle('child_closed', diagnosticsWithoutContent(result))
+      resolve(result)
+    }
+    const terminate = (cause, timer) => {
+      if (terminationCause) return
+      terminationCause = cause
+      timerIdentity = timer
+      lifecycle('signal_sent', { signal: 'SIGTERM', timerIdentity: timer })
       child.kill('SIGTERM')
-      forceTimer = setTimeout(() => child.kill('SIGKILL'), 2000)
-      forceTimer.unref?.()
+      forceTimer = setTimeout(() => {
+        lifecycle('signal_sent', { signal: 'SIGKILL', timerIdentity: 'sigterm_grace' })
+        child.kill('SIGKILL')
+      }, sigtermGraceMs)
+      closeTimer = setTimeout(() => settle(null, null, 'close_timeout'), sigtermGraceMs + closeTimeoutMs)
+    }
+    child.once('error', (error) => {
+      lifecycle('spawn_error', { errorCode: error?.code || null })
+      terminationCause = 'spawn_error'
+      settle(null, null, 'spawn_error')
+    })
+    runtimeTimer = setTimeout(() => {
+      timedOut = true
+      terminate('parent_timeout', 'runtime_deadline')
     }, timeoutMs)
-    timer.unref?.()
     child.once('close', (code, signal) => {
-      clearTimeout(timer)
-      if (forceTimer) clearTimeout(forceTimer)
-      resolve({ code: code ?? 1, signal, timedOut, overflow, stdout })
+      const cause = terminationCause || (signal ? 'signal_exit' : code === 0 ? 'completed' : 'nonzero_exit')
+      settle(code, signal, cause)
     })
   })
+}
+
+export async function runBoundedCleanup(cleanup, timeoutMs = 2_000) {
+  let timer
+  try {
+    await Promise.race([
+      Promise.resolve().then(cleanup),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('Invocation cleanup exceeded its external deadline.')
+          error.code = 'helm_link_cleanup_timeout'
+          reject(error)
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function diagnosticsWithoutContent(result) {
+  const { stdout: _stdout, stderr: _stderr, ...diagnostics } = result
+  return diagnostics
 }
 
 function baseEvent(state, dispatch, kind, body) {
@@ -602,7 +1056,22 @@ function baseEvent(state, dispatch, kind, body) {
   }
   const hash = eventHash(unsigned)
   return {
-    event: { protocolVersion: PROTOCOL, dispatchId: dispatch.id, messageId: dispatch.messageId, eventId: unsigned.eventId, sequence, kind, body, previousHash, eventHash: hash, occurredAt },
+    event: {
+      protocolVersion: PROTOCOL,
+      dispatchId: dispatch.id,
+      messageId: dispatch.messageId,
+      eventId: unsigned.eventId,
+      sequence,
+      kind,
+      body,
+      previousHash,
+      eventHash: hash,
+      occurredAt,
+      // Blocker 1: fence authorization must be signed. Present the current
+      // ownership epoch inside the signed event body; the server never
+      // authorizes from the unsigned `x-helm-link-fencing-token` header.
+      deliveryFencingToken: Number(state.fencingToken || 0),
+    },
     nextState: { sequence, lastHash: hash },
   }
 }
@@ -754,54 +1223,257 @@ function sanitizeCustomerText(value, limit) {
 async function runLoop() {
   const state = loadState()
   if (!state) throw new Error('No connector state. Run connect first.')
-  const liveness = {
-    lastPollCompletedAt: 0,
-    pollStartedAt: 0,
-    lastDispatchProgressAt: 0,
-    activeDispatchId: null,
-    activeDispatchStartedAt: null,
+  migrateProcessedLedger(STATE_DIR, state)
+  try {
+    await acquireBindingFence(state)
+    // A connector restart must converge durable terminal intent before it may
+    // acquire new work. Failure is terminal for this process attempt: the
+    // supervisor can retry, but the acquisition loop never opens while a
+    // terminal boundary is unresolved.
+    await convergeStartupTerminals(
+      state,
+      listInvocationClaims(STATE_DIR),
+      {
+        lastPollCompletedAt: 0, lastDispatchProgressAt: 0,
+        activeDispatchId: null, queueDepth: 0,
+      },
+    )
+    await runConnectorLoops(state)
+  } catch (error) {
+    throw mapTerminalConnectorError(error, state)
   }
-  let presenceTimer = null
-  for (;;) {
-    try {
-      if (!presenceTimer) {
-        await presence(state, liveness)
-        let presenceInFlight = false
-        presenceTimer = setInterval(() => {
-          if (presenceInFlight) return
-          presenceInFlight = true
-          void presence(state, liveness)
-            .catch((error) => console.error(`[helm-link] presence heartbeat failed: ${error.message}`))
-            .finally(() => { presenceInFlight = false })
-        }, 30_000)
-      }
-      await flushPendingAcks(state, liveness)
-      liveness.pollStartedAt = Date.now()
-      const body = await postJson(state, '/api/helm-link/connector/poll', { protocolVersion: PROTOCOL })
-      liveness.pollStartedAt = 0
-      liveness.lastPollCompletedAt = Date.now()
-      if (body.dispatch) await handleDispatch(state, body.dispatch, liveness)
-      else await sleep(body.retryAfterMs || 5000)
-    } catch (error) {
-      liveness.pollStartedAt = 0
-      if (error.status === 403 || error.status === 410 || /revoked/i.test(error.message)) {
-        state.status = 'revoked'
-        state.revokedAt = new Date().toISOString()
-        saveState(state)
-        if (presenceTimer) clearInterval(presenceTimer)
-        // HFA-005 — revocation is terminal. Exit non-zero with a stable
-        // sentinel code so packaged supervisors can distinguish owner
-        // revocation from transient failure.
-        // launchd/container: run-supervised.sh maps 75 to a clean stop.
-        // systemd: Restart=on-failure + RestartPreventExitStatus=75.
-        // Docker: wrapper + bounded on-failure retries.
-        console.error('[helm-link] binding revoked; stopping connector loop (terminal)')
-        process.exit(75)
-      }
-      console.error(`[helm-link] ${error.message}`)
-      await sleep(5000)
+}
+
+export function mapTerminalConnectorError(error, state, { persist = saveState } = {}) {
+  if (!isTerminalConnectorError(error)) return error
+  state.status = 'revoked'
+  state.revokedAt = state.revokedAt || new Date().toISOString()
+  persist(state)
+  error.exitCode = 75
+  return error
+}
+
+export async function runConnectorLoops(state, options = {}) {
+  const postImpl = options.postImpl || postJson
+  const controlPostImpl = options.controlPostImpl || postControlJson
+  const handleImpl = options.handleImpl || handleDispatch
+  const presenceImpl = options.presenceImpl || presence
+  const telemetryImpl = options.telemetryImpl || collectTelemetry
+  const sleepImpl = options.sleepImpl || sleep
+  const signal = options.signal
+  const idlePollMs = options.idlePollMs ?? 5_000
+  const busyCheckMs = options.busyCheckMs ?? 100
+  const presenceMs = options.presenceMs ?? 30_000
+  const telemetryMs = options.telemetryMs ?? 30_000
+  const telemetryTimeoutMs = options.telemetryTimeoutMs ?? 40_000
+  const cancellationMs = options.cancellationMs ?? 250
+  const liveness = {
+    lastPollCompletedAt: 0, pollStartedAt: 0, lastDispatchProgressAt: 0,
+    activeDispatchId: null, activeGatewayRunId: null, activeDispatchStartedAt: null,
+    cancellation: null, queueDepth: 0,
+  }
+  const queue = []
+  const telemetry = { openclawVersion: null, runtimeModel: null, updatedAt: null }
+  let executing = false
+  const stopped = () => signal?.aborted === true
+  const pause = (ms) => stopped() ? Promise.resolve() : sleepImpl(ms)
+
+  const acquisitionLoop = async () => {
+    while (!stopped()) {
+      try {
+        const localCapacity = executing || queue.length ? 0 : 1
+        liveness.pollStartedAt = Date.now()
+        const body = await postImpl(state, '/api/helm-link/connector/poll', {
+          protocolVersion: PROTOCOL,
+          localCapacity,
+          admissionContract: 'openclaw-agent-lane-v1',
+          runtimeState: telemetry.runtimeState || 'unknown',
+          runtimeStateObservedAt: telemetry.updatedAt,
+        })
+        liveness.lastPollCompletedAt = Date.now()
+        liveness.queueDepth = Number(body.queueDepth || 0)
+        if (body.dispatch && localCapacity === 0) throw new Error('Server dispatched work at zero local capacity.')
+        if (body.dispatch) queue.push(body.dispatch)
+        else await pause(body.retryAfterMs ?? idlePollMs)
+      } catch (error) {
+        if (isTerminalConnectorError(error)) throw error
+        console.error(`[helm-link] acquisition failed: ${error.message}`)
+        await pause(idlePollMs)
+      } finally { liveness.pollStartedAt = 0 }
     }
   }
+  const executionLoop = async () => {
+    while (!stopped()) {
+      const dispatch = queue.shift()
+      if (!dispatch) { await pause(busyCheckMs); continue }
+      executing = true
+      liveness.queueDepth = Math.max(0, liveness.queueDepth - 1)
+      try { await handleImpl(state, dispatch, liveness) }
+      catch (error) { console.error(`[helm-link] execution failed: ${error.message}`) }
+      finally { executing = false }
+    }
+  }
+  const presenceLoop = async () => {
+    while (!stopped()) {
+      try { await presenceImpl(state, liveness, deriveLivenessPresence(liveness), telemetry) }
+      catch (error) { console.error(`[helm-link] presence failed: ${error.message}`) }
+      await pause(presenceMs)
+    }
+  }
+  const telemetryLoop = async () => {
+    while (!stopped()) {
+      try {
+        const next = await withDeadline(telemetryImpl(state), telemetryTimeoutMs, 'telemetry')
+        Object.assign(telemetry, next, { updatedAt: new Date().toISOString() })
+      } catch (error) { console.error(`[helm-link] telemetry failed: ${error.message}`) }
+      await pause(telemetryMs)
+    }
+  }
+  const cancellationLoop = async () => {
+    let lastRequestedAt = null
+    const journal = createLifecycleJournal(LIFECYCLE_FILE)
+    while (!stopped()) {
+      try {
+        if (liveness.activeDispatchId) {
+          const body = await controlPostImpl(state, '/api/helm-link/connector/cancellations', {
+            protocolVersion: PROTOCOL,
+            dispatchId: liveness.activeDispatchId,
+          })
+          if (body.cancellation?.requestedAt && body.cancellation.requestedAt !== lastRequestedAt) {
+            lastRequestedAt = body.cancellation.requestedAt
+            journal('cancellation_request_observed', {
+              dispatchId: liveness.activeDispatchId,
+              bindingId: state.bindingId,
+              gatewayRunId: liveness.activeGatewayRunId,
+              requestedAt: body.cancellation.requestedAt,
+            })
+            // Publish cancellation intent before awaiting Gateway. The original
+            // child may terminate first; that race must enter the same absorbing
+            // terminal path as a completed cancel response, never the generic
+            // process-failure path.
+            await requestGatewayCancellation(state, liveness, body.cancellation.requestedAt, {
+              cancelImpl: options.cancelImpl || cancelGatewayAgentRun,
+              lifecycle: (kind, fields) => journal(kind, {
+                dispatchId: liveness.activeDispatchId,
+                bindingId: state.bindingId,
+                gatewayRunId: liveness.activeGatewayRunId,
+                ...fields,
+              }),
+            })
+          }
+        } else lastRequestedAt = null
+      } catch (error) { console.error(`[helm-link] cancellation check failed: ${error.message}`) }
+      await pause(cancellationMs)
+    }
+  }
+  await Promise.all([acquisitionLoop(), executionLoop(), presenceLoop(), telemetryLoop(), cancellationLoop()])
+}
+
+export async function requestGatewayCancellation(state, liveness, requestedAt, {
+  cancelImpl = cancelGatewayAgentRun,
+  lifecycle = () => {},
+} = {}) {
+  const cancellation = {
+    requested: true,
+    requestedAt,
+    resolved: false,
+    cancelled: false,
+    providerStarted: null,
+  }
+  // Synchronous publication is the race boundary: handleDispatch can now see
+  // intent even if the original child exits before agent.cancel returns.
+  liveness.cancellation = cancellation
+  try {
+    lifecycle('gateway_cancel_request_started', { requestedAt })
+    const outcome = await cancelImpl(state, liveness.activeGatewayRunId)
+    Object.assign(cancellation, outcome, { resolved: true })
+    lifecycle('gateway_cancel_response', {
+      requestedAt,
+      cancelled: cancellation.cancelled === true,
+      providerStarted: cancellation.providerStarted,
+      status: typeof cancellation.status === 'string' ? cancellation.status : null,
+    })
+  } catch (error) {
+    Object.assign(cancellation, { resolved: true, error: error?.message || String(error) })
+    lifecycle('gateway_cancel_error', {
+      requestedAt,
+      errorName: error?.name || 'Error',
+      errorCode: error?.code || null,
+    })
+  }
+  return cancellation
+}
+
+export async function cancelGatewayAgentRun(state, runId, { runImpl = runOpenClawAdvisory } = {}) {
+  const result = await runImpl({
+    args: ['gateway', 'call', 'agent.cancel', '--params', JSON.stringify({
+      runId,
+      agentId: state.runtimeAgentId,
+      sessionKey: `agent:${state.runtimeAgentId}:helm-run:${state.bindingId}:${runId}`,
+    }), '--json', '--timeout', '5000'],
+    timeoutMs: 7_000,
+    outputLimit: 50_000,
+    stderrLimit: 25_000,
+  })
+  if (result.terminationCause !== 'completed') return { cancelled: false, providerStarted: null }
+  try {
+    const parsed = JSON.parse(result.stdout)
+    return parsed?.payload ?? parsed?.result ?? parsed
+  } catch {
+    return { cancelled: false, providerStarted: null }
+  }
+}
+
+async function collectTelemetry(state) {
+  const [versionResult, agentsResult] = await Promise.all([
+    runOpenClawAdvisory({ args: ['--version'], timeoutMs: 10_000, outputLimit: 10_000, stderrLimit: 10_000 }),
+    runOpenClawAdvisory({ args: ['agents', 'list', '--json'], timeoutMs: 30_000, outputLimit: 250_000, stderrLimit: 50_000 }),
+  ])
+  let runtimeModel = null
+  if (agentsResult.terminationCause === 'completed') {
+    try {
+      const parsed = JSON.parse(agentsResult.stdout)
+      const agents = Array.isArray(parsed) ? parsed : parsed.agents || []
+      const agent = agents.find((item) => String(item.id || item.agentId || item.name) === state.runtimeAgentId)
+      const configured = String(agent?.model ?? agent?.modelId ?? '').trim()
+      if (configured) runtimeModel = { configured, provider: configured.split('/')[0] || 'unknown' }
+    } catch {}
+  }
+  return {
+    openclawVersion: versionResult.terminationCause === 'completed' ? versionResult.stdout.trim().slice(0, 120) : null,
+    runtimeModel,
+    // Stored-session recency and process existence are not capacity signals.
+    // OpenClaw 2026.7.1 exposes no supported agent-level in-flight primitive.
+    runtimeState: 'unknown',
+  }
+}
+
+function withDeadline(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms`)), timeoutMs)
+    Promise.resolve(promise).then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+function isTerminalConnectorError(error) {
+  return error?.status === 403 || error?.status === 410 || /revoked/i.test(error?.message || '')
+}
+
+export async function acquireBindingFence(state, { postImpl = postJson, persist = saveState } = {}) {
+  const response = await postImpl(state, '/api/helm-link/connector/ownership', {
+    protocolVersion: PROTOCOL,
+  })
+  const fencingToken = Number(response?.fencingToken)
+  if (!Number.isSafeInteger(fencingToken) || fencingToken <= Number(state.fencingToken || 0)) {
+    throw new Error('Server returned a non-monotonic fencing token.')
+  }
+  state.fencingToken = fencingToken
+  state.fenceIssuedAt = response.issuedAt || new Date().toISOString()
+  persist(state)
+  return fencingToken
 }
 
 function sleep(ms) {
@@ -845,6 +1517,7 @@ if (invokedDirectly) {
     if (cmd === 'doctor') await doctor(args)
     else if (cmd === 'connect') await connect(args)
     else if (cmd === 'install-service') console.log(JSON.stringify(installService(), null, 2))
+    else if (cmd === 'uninstall-service') console.log(JSON.stringify(uninstallService(), null, 2))
     else if (cmd === 'service-status') serviceStatus()
     else if (cmd === 'run') await runLoop()
     else if (cmd === 'status') await status()
@@ -852,6 +1525,6 @@ if (invokedDirectly) {
     else usage(2)
   } catch (error) {
     console.error(error.message)
-    process.exit(1)
+    process.exit(Number.isInteger(error.exitCode) ? error.exitCode : 1)
   }
 }
