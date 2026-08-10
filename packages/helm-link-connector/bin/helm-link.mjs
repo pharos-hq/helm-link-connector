@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.1'
+const VERSION = '0.2.2'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -498,9 +498,11 @@ export function uninstallService({ platformName = platform() } = {}) {
 function launchdProcessFromOutput(output) {
   const pid = Number(output.match(/(?:^|\n)\s*pid\s*=\s*(\d+)/)?.[1] || 0)
   const state = output.match(/(?:^|\n)\s*state\s*=\s*([^\n]+)/)?.[1]?.trim() || null
+  const disabled = /(?:^|\n)\s*disabled\s*=\s*true\b/.test(output)
   return {
     pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
     launchdState: state,
+    disabled,
   }
 }
 
@@ -521,6 +523,10 @@ function latestHeartbeatFresh(state, nowMs = Date.now()) {
   return Number.isFinite(parsed) && nowMs - parsed < DATA_PLANE_STALE_MS * 3
 }
 
+function runtimeClosureComplete(paths = servicePaths()) {
+  return existsSync(paths.connector) && existsSync(join(paths.runtimeDir, 'lib', 'lifecycle-journal.mjs'))
+}
+
 export function connectorStatus({ platformName = platform(), nowMs = Date.now() } = {}) {
   const state = loadState()
   if (!state) {
@@ -532,6 +538,8 @@ export function connectorStatus({ platformName = platform(), nowMs = Date.now() 
       serviceEnabled: false,
       processRunning: false,
       serverReachable: false,
+      heartbeatAccepted: false,
+      runtimeComplete: false,
       stateFile: STATE_FILE,
       version: VERSION,
       connectorVersion: VERSION,
@@ -550,6 +558,8 @@ export function connectorStatus({ platformName = platform(), nowMs = Date.now() 
       serviceEnabled: false,
       processRunning: false,
       serverReachable: false,
+      heartbeatAccepted: false,
+      runtimeComplete: false,
       status: state.status || 'unknown',
       stateFile: STATE_FILE,
       version: VERSION,
@@ -565,26 +575,32 @@ export function connectorStatus({ platformName = platform(), nowMs = Date.now() 
   const result = runLaunchctl(['print', target], { allowFailure: true })
   const launchd = launchdProcessFromOutput(result.stdout || '')
   const processRunning = pidIsRunning(launchd.pid)
-  const heartbeatFresh = latestHeartbeatFresh(state, nowMs)
+  const heartbeatAccepted = latestHeartbeatFresh(state, nowMs)
   const installed = result.status === 0
+  const serviceEnabled = Boolean(installed && !launchd.disabled)
+  const runtimeComplete = runtimeClosureComplete()
   const locallyPaired = state.status === 'paired'
-  const connected = Boolean(installed && processRunning && locallyPaired && heartbeatFresh)
+  const connected = Boolean(installed && serviceEnabled && runtimeComplete && processRunning && locallyPaired && heartbeatAccepted)
   let actionableFailureReason = null
   if (state.status === 'revoked') actionableFailureReason = 'Server authority was revoked. Reconnect in Helm with a fresh enrollment.'
   else if (!installed) actionableFailureReason = 'LaunchAgent is not installed. Run helm-link install-service after pairing.'
+  else if (!serviceEnabled) actionableFailureReason = 'LaunchAgent is installed but disabled. Run helm-link install-service to enable and restart it.'
+  else if (!runtimeComplete) actionableFailureReason = 'LaunchAgent runtime is incomplete. Run helm-link install-service to reinstall the packaged connector runtime.'
   else if (!processRunning) actionableFailureReason = 'LaunchAgent is installed but the connector process is not running. Run helm-link install-service to refresh the supervised runtime.'
   else if (!locallyPaired) actionableFailureReason = 'Local connector state is not paired. Reconnect in Helm with a fresh enrollment.'
-  else if (!heartbeatFresh) actionableFailureReason = 'No recent server-accepted heartbeat. Wait for the connector to reach Helm or reconnect if the server binding is stale.'
+  else if (!heartbeatAccepted) actionableFailureReason = 'No recent server-accepted heartbeat. Wait for the connector to reach Helm or reconnect if the server binding is stale.'
   return {
     label: SERVICE_LABEL,
     installed,
     connected,
     locallyPaired,
-    serviceEnabled: installed,
+    serviceEnabled,
     processRunning,
     pid: launchd.pid,
     launchdState: launchd.launchdState,
-    serverReachable: heartbeatFresh,
+    serverReachable: heartbeatAccepted,
+    heartbeatAccepted,
+    runtimeComplete,
     status: state.status || 'unknown',
     stateFile: STATE_FILE,
     version: VERSION,
@@ -1589,8 +1605,10 @@ async function status() {
     connected: service ? service.connected : false,
     locallyPaired: state.status === 'paired',
     serverReachable: service ? service.serverReachable : false,
+    heartbeatAccepted: service ? service.heartbeatAccepted : false,
     processRunning: service ? service.processRunning : false,
     serviceEnabled: service ? service.serviceEnabled : false,
+    runtimeComplete: service ? service.runtimeComplete : false,
     server: state.server,
     bindingId: state.bindingId,
     runtimeAgentId: state.runtimeAgentId,

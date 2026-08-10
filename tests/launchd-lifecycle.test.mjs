@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
@@ -19,9 +19,15 @@ if [ "$1" = "print" ]; then
   if [ -n "$HELM_LINK_FAKE_LAUNCHD_PID" ]; then
     printf 'state = running\\n'
     printf 'pid = %s\\n' "$HELM_LINK_FAKE_LAUNCHD_PID"
+    if [ "$HELM_LINK_FAKE_LAUNCHD_DISABLED" = "1" ]; then
+      printf 'disabled = true\\n'
+    fi
     exit 0
   fi
   printf 'state = exited\\n'
+  if [ "$HELM_LINK_FAKE_LAUNCHD_DISABLED" = "1" ]; then
+    printf 'disabled = true\\n'
+  fi
   exit 0
 fi
 exit 0
@@ -40,9 +46,9 @@ writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ status: 'paired' })
 const first = installService({ platformName: 'darwin' })
 const second = installService({ platformName: 'darwin' })
 assert.equal(first.installed, true)
-assert.equal(second.version, '0.2.1')
-assert.equal(existsSync(join(stateDir, 'runtime', '0.2.1', 'bin', 'helm-link.mjs')), true)
-assert.equal(existsSync(join(stateDir, 'runtime', '0.2.1', 'lib', 'lifecycle-journal.mjs')), true)
+assert.equal(second.version, '0.2.2')
+assert.equal(existsSync(join(stateDir, 'runtime', '0.2.2', 'bin', 'helm-link.mjs')), true)
+assert.equal(existsSync(join(stateDir, 'runtime', '0.2.2', 'lib', 'lifecycle-journal.mjs')), true)
 
 const plist = readFileSync(first.plist, 'utf8')
 assert.match(plist, /<key>RunAtLoad<\/key><true\/>/)
@@ -73,9 +79,33 @@ assert.ok(
 const staleStatus = connectorStatus({ platformName: 'darwin' })
 assert.equal(staleStatus.connected, false)
 assert.equal(staleStatus.installed, true)
+assert.equal(staleStatus.serviceEnabled, true)
+assert.equal(staleStatus.runtimeComplete, true)
 assert.equal(staleStatus.processRunning, false)
+assert.equal(staleStatus.heartbeatAccepted, false)
 assert.match(staleStatus.actionableFailureReason, /not running/i)
 
+process.env.HELM_LINK_FAKE_LAUNCHD_DISABLED = '1'
+process.env.HELM_LINK_FAKE_LAUNCHD_PID = String(process.pid)
+const disabledStatus = connectorStatus({ platformName: 'darwin' })
+assert.equal(disabledStatus.connected, false)
+assert.equal(disabledStatus.installed, true)
+assert.equal(disabledStatus.serviceEnabled, false)
+assert.equal(disabledStatus.processRunning, true)
+assert.match(disabledStatus.actionableFailureReason, /disabled/i)
+delete process.env.HELM_LINK_FAKE_LAUNCHD_DISABLED
+delete process.env.HELM_LINK_FAKE_LAUNCHD_PID
+
+rmSync(join(stateDir, 'runtime', '0.2.2', 'lib', 'lifecycle-journal.mjs'))
+process.env.HELM_LINK_FAKE_LAUNCHD_PID = String(process.pid)
+const incompleteRuntimeStatus = connectorStatus({ platformName: 'darwin' })
+assert.equal(incompleteRuntimeStatus.connected, false)
+assert.equal(incompleteRuntimeStatus.runtimeComplete, false)
+assert.equal(incompleteRuntimeStatus.processRunning, true)
+assert.match(incompleteRuntimeStatus.actionableFailureReason, /runtime is incomplete/i)
+delete process.env.HELM_LINK_FAKE_LAUNCHD_PID
+
+installService({ platformName: 'darwin' })
 process.env.HELM_LINK_FAKE_LAUNCHD_PID = String(process.pid)
 writeFileSync(join(stateDir, 'state.json'), JSON.stringify({
   status: 'paired',
@@ -87,9 +117,12 @@ writeFileSync(join(stateDir, 'state.json'), JSON.stringify({
 const liveStatus = connectorStatus({ platformName: 'darwin' })
 assert.equal(liveStatus.connected, true)
 assert.equal(liveStatus.processRunning, true)
+assert.equal(liveStatus.serviceEnabled, true)
 assert.equal(liveStatus.serverReachable, true)
+assert.equal(liveStatus.heartbeatAccepted, true)
+assert.equal(liveStatus.runtimeComplete, true)
 assert.equal(liveStatus.boundRuntimeAgentId, 'forge')
-assert.equal(liveStatus.connectorVersion, '0.2.1')
+assert.equal(liveStatus.connectorVersion, '0.2.2')
 
 const uninstall = uninstallService({ platformName: 'darwin' })
 assert.equal(uninstall.uninstalled, true)

@@ -4,9 +4,13 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -18,7 +22,7 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.2.1')
+  assert.equal(manifest.version, '0.2.2')
   assert.equal(Object.keys(manifest.files).length, 12)
 
   const expectedFiles = [
@@ -63,9 +67,9 @@ try {
     workflow,
     /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|npm login|npm adduser/,
   )
-  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.1\.tgz/)
+  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.2\.tgz/)
   assert.match(workflow, new RegExp(manifest.archive.sha256))
-  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.1'/)
+  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.2'/)
   assert.match(workflow, /helm-link" doctor --agent fixture-agent/)
 
   const installRoot = temporaryDirectory('helm-link-install-')
@@ -114,12 +118,73 @@ try {
     'fixture-agent',
   )
 
+  const packedLifecycleRoot = temporaryDirectory('helm-link-packed-lifecycle-')
+  const packedStateDir = join(packedLifecycleRoot, 'state')
+  const packedLaunchAgents = join(packedLifecycleRoot, 'LaunchAgents')
+  const packedLaunchctlLog = join(packedLifecycleRoot, 'launchctl.log')
+  const fakeLaunchctl = join(packedLifecycleRoot, 'launchctl')
+  mkdirSync(packedStateDir, { recursive: true, mode: 0o700 })
+  writeFileSync(join(packedStateDir, 'state.json'), JSON.stringify({
+    status: 'paired',
+    runtimeAgentId: 'forge',
+    helmAgentId: '00000000-0000-4000-8000-000000000071',
+    bindingId: '00000000-0000-4000-8000-000000000172',
+  }), { mode: 0o600 })
+  writeFileSync(fakeLaunchctl, `#!/bin/sh
+printf '%s\\n' "$*" >> "${packedLaunchctlLog}"
+if [ "$1" = "print" ]; then
+  printf 'state = exited\\n'
+  exit 0
+fi
+exit 0
+`, { mode: 0o700 })
+  chmodSync(fakeLaunchctl, 0o700)
+  const lifecycleEnv = {
+    ...process.env,
+    HELM_LINK_STATE_DIR: packedStateDir,
+    HELM_LINK_LAUNCH_AGENTS_DIR: packedLaunchAgents,
+    HELM_LINK_LAUNCHCTL_BIN: fakeLaunchctl,
+    HELM_LINK_OPENCLAW_BIN: fixture,
+  }
+  const installedCli = join(installRoot, 'node_modules/.bin/helm-link')
+  const packedInstall = spawnSync(installedCli, ['install-service'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: lifecycleEnv,
+  })
+  assert.equal(packedInstall.status, 0, packedInstall.stderr)
+  const packedRuntimeDependency = join(packedStateDir, 'runtime', '0.2.2', 'lib', 'lifecycle-journal.mjs')
+  assert.equal(existsSync(packedRuntimeDependency), true)
+  const stoppedStatus = spawnSync(installedCli, ['service-status'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: lifecycleEnv,
+  })
+  assert.notEqual(stoppedStatus.status, 0)
+  const stoppedStatusJson = JSON.parse(stoppedStatus.stdout)
+  assert.equal(stoppedStatusJson.installed, true)
+  assert.equal(stoppedStatusJson.serviceEnabled, true)
+  assert.equal(stoppedStatusJson.processRunning, false)
+  assert.equal(stoppedStatusJson.heartbeatAccepted, false)
+  assert.equal(stoppedStatusJson.runtimeComplete, true)
+  unlinkSync(packedRuntimeDependency)
+  const missingRuntimeStatus = spawnSync(installedCli, ['service-status'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: lifecycleEnv,
+  })
+  assert.notEqual(missingRuntimeStatus.status, 0)
+  const missingRuntimeJson = JSON.parse(missingRuntimeStatus.stdout)
+  assert.equal(missingRuntimeJson.runtimeComplete, false)
+  assert.match(missingRuntimeJson.actionableFailureReason, /runtime is incomplete/i)
+
   console.log('VERIFIED source manifest declares 12 audited package files')
-  console.log('VERIFIED release candidate 0.2.1 is not wired to publication')
+  console.log('VERIFIED release candidate 0.2.2 is not wired to publication')
   console.log(`VERIFIED reproducible release SHA-256: ${first.hash}`)
-  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.1')
+  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.2')
   console.log('VERIFIED exact cold-cache registry install gate')
   console.log('VERIFIED installed CLI doctor contract')
+  console.log('VERIFIED packed artifact lifecycle detects stopped service and missing runtime dependency')
 } finally {
   for (const directory of temporaryDirectories) {
     rmSync(directory, { recursive: true, force: true })
