@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.5'
+const VERSION = '0.2.6'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -153,9 +153,13 @@ function runtimeModelForAgent(agentId) {
 }
 
 export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false } = {}) {
-  if (DENIED.test(text)) throw new Error('Advisory-only Helm Link accepts chat, not tool or execution commands.')
-  if (classifyWorkloadText(text).lane !== 'chat') throw new Error('Operational work requires a durable Helm Link Run.')
-  if (!noToolsAttested) throw new Error('Chat lane requires a host-attested no-tools advisory agent.')
+  // Lane selection is an explicit Helm dispatch contract, never a prompt
+  // classifier. Ordinary connected OpenClaw agents keep their existing host
+  // policy; Helm transports chat but grants no additional tool authority.
+  // The legacy no-tools advisory restrictions remain only for runtimes that
+  // truthfully opted into that stricter host-attested mode.
+  if (noToolsAttested && DENIED.test(text)) throw new Error('Advisory-only Helm Link accepts chat, not tool or execution commands.')
+  if (noToolsAttested && classifyWorkloadText(text).lane !== 'chat') throw new Error('Operational work requires a durable Helm Link Run.')
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-message-'))
   const file = join(dir, 'message.txt')
@@ -874,43 +878,54 @@ function gatewayEnvelopeOutcome(stdout) {
   }
 }
 
-export async function handleDispatch(state, dispatch, liveness) {
-  if (readTerminalRecord(STATE_DIR, dispatch.id)) return
+export async function handleDispatch(state, dispatch, liveness, options = {}) {
+  const root = options.root ?? STATE_DIR
+  const registerClaimImpl = options.registerClaimImpl ?? registerInvocationClaim
+  const postEventImpl = options.postEventImpl ?? postConnectorEvent
+  const acknowledgeImpl = options.acknowledgeImpl ?? acknowledgeTerminal
+  const runImpl = options.runImpl ?? runOpenClawAdvisory
+  const operationalArgsImpl = options.operationalArgsImpl ?? operationalArgs
+  const advisoryArgsImpl = options.advisoryArgsImpl ?? advisoryArgs
+  if (readTerminalRecord(root, dispatch.id)) return
   if (state.pendingAcks?.[dispatch.id]) {
-    await flushPendingAcks(state, liveness)
+    await flushPendingAcks(state, liveness, { root })
     return
   }
-  const journal = createLifecycleJournal(LIFECYCLE_FILE)
+  const journal = createLifecycleJournal(options.lifecycleFile ?? LIFECYCLE_FILE)
   const invocationId = randomUUID()
-  const claim = claimInvocation(STATE_DIR, {
+  const claim = claimInvocation(root, {
     dispatchId: dispatch.id,
     bindingId: state.bindingId,
     fencingToken: Number(state.fencingToken || 0),
     invocationId,
   })
   journal('invocation_claimed', claim)
-  await registerInvocationClaim(state, claim)
-  journal('invocation_claim_registered', {
-    dispatchId: dispatch.id,
-    bindingId: state.bindingId,
-    invocationId,
-    fencingToken: claim.fencingToken,
-  })
   const text = String(dispatch.payload?.text || '')
   const lane = dispatch.payload?.kind === 'run' ? 'run' : 'chat'
-  const invocation = lane === 'run'
-    ? operationalArgs(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt)
-    : advisoryArgs(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
+  let invocation = null
+  let phase = 'claim-registration'
   state.activeInvocationId = invocationId
   liveness.activeDispatchId = dispatch.id
   liveness.activeGatewayRunId = dispatch.id
   liveness.cancellation = null
   liveness.activeDispatchStartedAt = Date.now()
   try {
+    await registerClaimImpl(state, claim)
+    journal('invocation_claim_registered', {
+      dispatchId: dispatch.id,
+      bindingId: state.bindingId,
+      invocationId,
+      fencingToken: claim.fencingToken,
+    })
+    phase = 'admission'
+    invocation = lane === 'run'
+      ? operationalArgsImpl(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt)
+      : advisoryArgsImpl(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
+    phase = 'execution'
     journal('dispatch_received', { dispatchId: dispatch.id, bindingId: state.bindingId })
-    await postConnectorEvent(state, statusEvent(state, dispatch, 'working'))
+    await postEventImpl(state, statusEvent(state, dispatch, 'working'))
     liveness.lastDispatchProgressAt = Date.now()
-    const result = await runOpenClawAdvisory({
+    const result = await runImpl({
       args: invocation.args,
       timeoutMs: invocation.timeoutMs,
       lifecycle: (kind, fields) => journal(kind, {
@@ -918,7 +933,7 @@ export async function handleDispatch(state, dispatch, liveness) {
         bindingId: state.bindingId,
         ...fields,
       }),
-      onSpawn: ({ pid, startedAt }) => markInvocationStarted(STATE_DIR, dispatch.id, {
+      onSpawn: ({ pid, startedAt }) => markInvocationStarted(root, dispatch.id, {
         invocationId,
         bindingId: state.bindingId,
         fencingToken: Number(state.fencingToken || 0),
@@ -959,8 +974,8 @@ export async function handleDispatch(state, dispatch, liveness) {
         providerStarted: liveness.cancellation.providerStarted,
         terminalCode,
       })
-      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
+      await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+      await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
         state: 'failed', terminalCode, terminalSummary: summary }, liveness)
       return
     }
@@ -975,8 +990,8 @@ export async function handleDispatch(state, dispatch, liveness) {
         close_timeout: ['openclaw_close_timeout', 'OpenClaw did not close within its external bound; no customer content produced.'],
       }
       const [terminalCode, summary] = terminalByCause[result.terminationCause] || ['openclaw_failed', 'OpenClaw advisory failed; no customer content produced.']
-      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode, terminalSummary: summary }, liveness)
+      await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+      await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode, terminalSummary: summary }, liveness)
     } else {
       // HFA-004 — extractText requires structured output; if OpenClaw
       // produced no parseable response frame the run is treated as a
@@ -984,8 +999,8 @@ export async function handleDispatch(state, dispatch, liveness) {
       const finalText = extractStructuredText(result.stdout)
       if (!finalText) {
         const summary = 'OpenClaw returned no structured response frame; no customer content produced.'
-        await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-        await acknowledgeTerminal(state, dispatch, {
+        await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+        await acknowledgeImpl(state, dispatch, {
           protocolVersion: PROTOCOL,
           dispatchId: dispatch.id,
           state: 'failed',
@@ -996,19 +1011,60 @@ export async function handleDispatch(state, dispatch, liveness) {
         // OpenClaw 2026.7.1 emits one JSON envelope at process completion,
         // not NDJSON streaming frames. Emit one bounded structured delta so
         // the protocol remains status -> delta -> final -> ack.
-        await postConnectorEvent(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
-        await postConnectorEvent(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
+        await postEventImpl(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
+        await postEventImpl(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
         // HFA-004 — exact locked recovery transcript literal.
-        await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' }, liveness)
+        await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' }, liveness)
       }
     }
+  } catch (error) {
+    // Once a dispatch is claimed, every failure must converge through the
+    // same durable terminal boundary. If acknowledgement intent already
+    // exists, leave it untouched for restart-safe idempotent delivery.
+    const hasTerminalIntent = pendingTerminalOutbox(root)
+      .some((acknowledgement) => acknowledgement.dispatchId === dispatch.id)
+      || Boolean(state.pendingAcks?.[dispatch.id])
+    if (!readTerminalRecord(root, dispatch.id) && !hasTerminalIntent) {
+      const detail = error instanceof Error ? error.message : String(error)
+      const terminalCode = phase === 'admission'
+        ? lane === 'run' ? 'helm_link_run_contract_invalid' : 'helm_link_chat_admission_failed'
+        : phase === 'claim-registration' ? 'helm_link_claim_registration_failed' : 'openclaw_invocation_failed'
+      const summary = `Claimed ${lane} dispatch failed during ${phase}: ${detail}`.slice(0, 500)
+      journal('post_claim_terminal_selected', {
+        dispatchId: dispatch.id,
+        bindingId: state.bindingId,
+        phase,
+        terminalCode,
+      })
+      try {
+        await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+      } catch (eventError) {
+        journal('terminal_event_delivery_failed', {
+          dispatchId: dispatch.id,
+          bindingId: state.bindingId,
+          errorCode: eventError?.code || null,
+        })
+      }
+      await acknowledgeImpl(state, dispatch, {
+        protocolVersion: PROTOCOL,
+        dispatchId: dispatch.id,
+        state: 'failed',
+        terminalCode,
+        terminalSummary: summary,
+      }, liveness)
+      return
+    }
+    throw error
   } finally {
-    await runBoundedCleanup(invocation.cleanup)
-    liveness.activeDispatchId = null
-    liveness.activeGatewayRunId = null
-    liveness.cancellation = null
-    liveness.activeDispatchStartedAt = null
-    delete state.activeInvocationId
+    try {
+      if (invocation) await runBoundedCleanup(invocation.cleanup)
+    } finally {
+      liveness.activeDispatchId = null
+      liveness.activeGatewayRunId = null
+      liveness.cancellation = null
+      liveness.activeDispatchStartedAt = null
+      delete state.activeInvocationId
+    }
   }
 }
 
