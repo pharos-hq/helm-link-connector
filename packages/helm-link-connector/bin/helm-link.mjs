@@ -8,7 +8,7 @@ import {
   randomUUID,
   sign,
 } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir, platform, release, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.0'
+const VERSION = '0.2.6'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -153,9 +153,13 @@ function runtimeModelForAgent(agentId) {
 }
 
 export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false } = {}) {
-  if (DENIED.test(text)) throw new Error('Advisory-only Helm Link accepts chat, not tool or execution commands.')
-  if (classifyWorkloadText(text).lane !== 'chat') throw new Error('Operational work requires a durable Helm Link Run.')
-  if (!noToolsAttested) throw new Error('Chat lane requires a host-attested no-tools advisory agent.')
+  // Lane selection is an explicit Helm dispatch contract, never a prompt
+  // classifier. Ordinary connected OpenClaw agents keep their existing host
+  // policy; Helm transports chat but grants no additional tool authority.
+  // The legacy no-tools advisory restrictions remain only for runtimes that
+  // truthfully opted into that stricter host-attested mode.
+  if (noToolsAttested && DENIED.test(text)) throw new Error('Advisory-only Helm Link accepts chat, not tool or execution commands.')
+  if (noToolsAttested && classifyWorkloadText(text).lane !== 'chat') throw new Error('Operational work requires a durable Helm Link Run.')
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-message-'))
   const file = join(dir, 'message.txt')
@@ -398,12 +402,29 @@ function servicePaths() {
   return {
     runtimeDir,
     logDir,
-    connector: join(runtimeDir, 'helm-link.mjs'),
+    connector: join(runtimeDir, 'bin', 'helm-link.mjs'),
     wrapper: join(runtimeDir, 'run-supervised.sh'),
     plist: join(process.env.HELM_LINK_LAUNCH_AGENTS_DIR || join(homedir(), 'Library', 'LaunchAgents'), `${SERVICE_LABEL}.plist`),
     stdout: join(logDir, 'connector.out.log'),
     stderr: join(logDir, 'connector.err.log'),
   }
+}
+
+function packageRoot() {
+  return join(dirname(__filename), '..')
+}
+
+function copyRuntimeClosure(runtimeDir) {
+  rmSync(runtimeDir, { recursive: true, force: true })
+  mkdirPrivate(runtimeDir)
+  for (const relativePath of ['bin', 'lib', 'supervisors', 'package.json']) {
+    cpSync(join(packageRoot(), relativePath), join(runtimeDir, relativePath), {
+      recursive: true,
+      force: true,
+      errorOnExist: false,
+    })
+  }
+  chmodSync(join(runtimeDir, 'bin', 'helm-link.mjs'), 0o700)
 }
 
 function runLaunchctl(args, { allowFailure = false } = {}) {
@@ -424,13 +445,11 @@ export function installService({ platformName = platform() } = {}) {
   if (state.status === 'revoked') throw new Error('Revoked connector state cannot be supervised. Reconnect with a fresh enrollment.')
 
   const paths = servicePaths()
-  mkdirPrivate(paths.runtimeDir)
+  copyRuntimeClosure(paths.runtimeDir)
   mkdirPrivate(paths.logDir)
   mkdirSync(dirname(paths.plist), { recursive: true, mode: 0o700 })
 
-  writeFileSync(paths.connector, readFileSync(__filename), { mode: 0o700 })
-  chmodSync(paths.connector, 0o700)
-  const packagedWrapper = join(dirname(__filename), '..', 'supervisors', 'run-supervised.sh')
+  const packagedWrapper = join(paths.runtimeDir, 'supervisors', 'run-supervised.sh')
   writeFileSync(paths.wrapper, readFileSync(packagedWrapper), { mode: 0o700 })
   chmodSync(paths.wrapper, 0o700)
 
@@ -461,8 +480,8 @@ export function installService({ platformName = platform() } = {}) {
   const domain = `gui/${process.getuid()}`
   const target = `${domain}/${SERVICE_LABEL}`
   runLaunchctl(['bootout', target], { allowFailure: true })
-  runLaunchctl(['bootstrap', domain, paths.plist])
   runLaunchctl(['enable', target])
+  runLaunchctl(['bootstrap', domain, paths.plist])
   runLaunchctl(['kickstart', '-k', target])
 
   return { installed: true, label: SERVICE_LABEL, plist: paths.plist, version: VERSION }
@@ -480,29 +499,141 @@ export function uninstallService({ platformName = platform() } = {}) {
   return { uninstalled: true, label: SERVICE_LABEL, plist: paths.plist, version: VERSION }
 }
 
-function serviceStatus() {
-  if (platform() !== 'darwin') throw new Error('service-status currently supports macOS launchd only.')
+function launchdProcessFromOutput(output) {
+  const pid = Number(output.match(/(?:^|\n)\s*pid\s*=\s*(\d+)/)?.[1] || 0)
+  const state = output.match(/(?:^|\n)\s*state\s*=\s*([^\n]+)/)?.[1]?.trim() || null
+  return {
+    pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+    launchdState: state,
+  }
+}
+
+function launchdServiceDisabledFromOutput(output, label = SERVICE_LABEL) {
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = output.match(new RegExp(`["']?${escapedLabel}["']?\\s*(?:=>|=)\\s*(true|false|enabled|disabled)\\b`))
+  return match ? ['true', 'disabled'].includes(match[1]) : null
+}
+
+function pidIsRunning(pid) {
+  if (!pid) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function latestHeartbeatFresh(state, nowMs = Date.now()) {
+  const raw = state?.lastSuccessfulHeartbeatAt
+  if (!raw) return false
+  const parsed = Date.parse(raw)
+  return Number.isFinite(parsed) && nowMs - parsed < DATA_PLANE_STALE_MS * 3
+}
+
+function runtimeClosureComplete(paths = servicePaths()) {
+  return existsSync(paths.connector) && existsSync(join(paths.runtimeDir, 'lib', 'lifecycle-journal.mjs'))
+}
+
+export function connectorStatus({ platformName = platform(), nowMs = Date.now() } = {}) {
   const state = loadState()
   if (!state) {
-    console.log(JSON.stringify({
+    return {
       label: SERVICE_LABEL,
       installed: false,
       connected: false,
+      locallyPaired: false,
+      serviceEnabled: false,
+      processRunning: false,
+      serverReachable: false,
+      heartbeatAccepted: false,
+      runtimeComplete: false,
       stateFile: STATE_FILE,
       version: VERSION,
-    }, null, 2))
-    return
+      connectorVersion: VERSION,
+      boundRuntimeAgentId: null,
+      boundHelmAgentId: null,
+      lastSuccessfulHeartbeatAt: null,
+      actionableFailureReason: 'No local connector state. Generate a fresh enrollment in Helm and run the connect command.',
+    }
+  }
+  if (platformName !== 'darwin') {
+    return {
+      label: SERVICE_LABEL,
+      installed: false,
+      connected: false,
+      locallyPaired: state.status === 'paired',
+      serviceEnabled: false,
+      processRunning: false,
+      serverReachable: false,
+      heartbeatAccepted: false,
+      runtimeComplete: false,
+      status: state.status || 'unknown',
+      stateFile: STATE_FILE,
+      version: VERSION,
+      connectorVersion: VERSION,
+      boundRuntimeAgentId: state.runtimeAgentId || null,
+      boundHelmAgentId: state.helmAgentId || null,
+      bindingId: state.bindingId || null,
+      lastSuccessfulHeartbeatAt: state.lastSuccessfulHeartbeatAt || null,
+      actionableFailureReason: 'service-status currently supports macOS launchd only on this host.',
+    }
   }
   const target = `gui/${process.getuid()}/${SERVICE_LABEL}`
   const result = runLaunchctl(['print', target], { allowFailure: true })
-  console.log(JSON.stringify({
+  const disabledResult = runLaunchctl(['print-disabled', `gui/${process.getuid()}`], { allowFailure: true })
+  const launchd = launchdProcessFromOutput(result.stdout || '')
+  const processRunning = pidIsRunning(launchd.pid)
+  const heartbeatAccepted = latestHeartbeatFresh(state, nowMs)
+  const paths = servicePaths()
+  const runtimePresent = existsSync(paths.runtimeDir)
+  const installed = existsSync(paths.plist) && runtimePresent
+  const disabled = disabledResult.status === 0
+    ? launchdServiceDisabledFromOutput(disabledResult.stdout || '', SERVICE_LABEL)
+    : null
+  const serviceEnabled = Boolean(installed && disabled === false)
+  const runtimeComplete = runtimeClosureComplete()
+  const locallyPaired = state.status === 'paired'
+  const connected = Boolean(installed && serviceEnabled && runtimeComplete && processRunning && locallyPaired && heartbeatAccepted)
+  let actionableFailureReason = null
+  if (state.status === 'revoked') actionableFailureReason = 'Server authority was revoked. Reconnect in Helm with a fresh enrollment.'
+  else if (!installed) actionableFailureReason = 'LaunchAgent is not installed. Run helm-link install-service after pairing.'
+  else if (!serviceEnabled) actionableFailureReason = disabled === true
+    ? 'LaunchAgent is installed but disabled. Run helm-link install-service to enable and restart it.'
+    : 'LaunchAgent enabled state could not be verified. Run helm-link install-service to refresh the supervised runtime.'
+  else if (!runtimeComplete) actionableFailureReason = 'LaunchAgent runtime is incomplete. Run helm-link install-service to reinstall the packaged connector runtime.'
+  else if (!processRunning) actionableFailureReason = 'LaunchAgent is installed but the connector process is not running. Run helm-link install-service to refresh the supervised runtime.'
+  else if (!locallyPaired) actionableFailureReason = 'Local connector state is not paired. Reconnect in Helm with a fresh enrollment.'
+  else if (!heartbeatAccepted) actionableFailureReason = 'No recent server-accepted heartbeat. Wait for the connector to reach Helm or reconnect if the server binding is stale.'
+  return {
     label: SERVICE_LABEL,
-    installed: result.status === 0,
-    connected: state.status === 'paired',
+    installed,
+    connected,
+    locallyPaired,
+    serviceEnabled,
+    processRunning,
+    pid: launchd.pid,
+    launchdState: launchd.launchdState,
+    launchdDisabled: disabled,
+    serverReachable: heartbeatAccepted,
+    heartbeatAccepted,
+    runtimeComplete,
     status: state.status || 'unknown',
     stateFile: STATE_FILE,
     version: VERSION,
-  }, null, 2))
+    connectorVersion: VERSION,
+    boundRuntimeAgentId: state.runtimeAgentId || null,
+    boundHelmAgentId: state.helmAgentId || null,
+    bindingId: state.bindingId || null,
+    lastSuccessfulHeartbeatAt: state.lastSuccessfulHeartbeatAt || null,
+    actionableFailureReason,
+  }
+}
+
+function serviceStatus() {
+  const result = connectorStatus()
+  console.log(JSON.stringify(result, null, 2))
+  if (!result.connected) process.exitCode = 1
 }
 
 export function deriveLivenessPresence(liveness, nowMs = Date.now()) {
@@ -747,43 +878,54 @@ function gatewayEnvelopeOutcome(stdout) {
   }
 }
 
-export async function handleDispatch(state, dispatch, liveness) {
-  if (readTerminalRecord(STATE_DIR, dispatch.id)) return
+export async function handleDispatch(state, dispatch, liveness, options = {}) {
+  const root = options.root ?? STATE_DIR
+  const registerClaimImpl = options.registerClaimImpl ?? registerInvocationClaim
+  const postEventImpl = options.postEventImpl ?? postConnectorEvent
+  const acknowledgeImpl = options.acknowledgeImpl ?? acknowledgeTerminal
+  const runImpl = options.runImpl ?? runOpenClawAdvisory
+  const operationalArgsImpl = options.operationalArgsImpl ?? operationalArgs
+  const advisoryArgsImpl = options.advisoryArgsImpl ?? advisoryArgs
+  if (readTerminalRecord(root, dispatch.id)) return
   if (state.pendingAcks?.[dispatch.id]) {
-    await flushPendingAcks(state, liveness)
+    await flushPendingAcks(state, liveness, { root })
     return
   }
-  const journal = createLifecycleJournal(LIFECYCLE_FILE)
+  const journal = createLifecycleJournal(options.lifecycleFile ?? LIFECYCLE_FILE)
   const invocationId = randomUUID()
-  const claim = claimInvocation(STATE_DIR, {
+  const claim = claimInvocation(root, {
     dispatchId: dispatch.id,
     bindingId: state.bindingId,
     fencingToken: Number(state.fencingToken || 0),
     invocationId,
   })
   journal('invocation_claimed', claim)
-  await registerInvocationClaim(state, claim)
-  journal('invocation_claim_registered', {
-    dispatchId: dispatch.id,
-    bindingId: state.bindingId,
-    invocationId,
-    fencingToken: claim.fencingToken,
-  })
   const text = String(dispatch.payload?.text || '')
   const lane = dispatch.payload?.kind === 'run' ? 'run' : 'chat'
-  const invocation = lane === 'run'
-    ? operationalArgs(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt)
-    : advisoryArgs(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
+  let invocation = null
+  let phase = 'claim-registration'
   state.activeInvocationId = invocationId
   liveness.activeDispatchId = dispatch.id
   liveness.activeGatewayRunId = dispatch.id
   liveness.cancellation = null
   liveness.activeDispatchStartedAt = Date.now()
   try {
+    await registerClaimImpl(state, claim)
+    journal('invocation_claim_registered', {
+      dispatchId: dispatch.id,
+      bindingId: state.bindingId,
+      invocationId,
+      fencingToken: claim.fencingToken,
+    })
+    phase = 'admission'
+    invocation = lane === 'run'
+      ? operationalArgsImpl(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt)
+      : advisoryArgsImpl(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
+    phase = 'execution'
     journal('dispatch_received', { dispatchId: dispatch.id, bindingId: state.bindingId })
-    await postConnectorEvent(state, statusEvent(state, dispatch, 'working'))
+    await postEventImpl(state, statusEvent(state, dispatch, 'working'))
     liveness.lastDispatchProgressAt = Date.now()
-    const result = await runOpenClawAdvisory({
+    const result = await runImpl({
       args: invocation.args,
       timeoutMs: invocation.timeoutMs,
       lifecycle: (kind, fields) => journal(kind, {
@@ -791,7 +933,7 @@ export async function handleDispatch(state, dispatch, liveness) {
         bindingId: state.bindingId,
         ...fields,
       }),
-      onSpawn: ({ pid, startedAt }) => markInvocationStarted(STATE_DIR, dispatch.id, {
+      onSpawn: ({ pid, startedAt }) => markInvocationStarted(root, dispatch.id, {
         invocationId,
         bindingId: state.bindingId,
         fencingToken: Number(state.fencingToken || 0),
@@ -832,8 +974,8 @@ export async function handleDispatch(state, dispatch, liveness) {
         providerStarted: liveness.cancellation.providerStarted,
         terminalCode,
       })
-      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
+      await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+      await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id,
         state: 'failed', terminalCode, terminalSummary: summary }, liveness)
       return
     }
@@ -848,8 +990,8 @@ export async function handleDispatch(state, dispatch, liveness) {
         close_timeout: ['openclaw_close_timeout', 'OpenClaw did not close within its external bound; no customer content produced.'],
       }
       const [terminalCode, summary] = terminalByCause[result.terminationCause] || ['openclaw_failed', 'OpenClaw advisory failed; no customer content produced.']
-      await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-      await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode, terminalSummary: summary }, liveness)
+      await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+      await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode, terminalSummary: summary }, liveness)
     } else {
       // HFA-004 — extractText requires structured output; if OpenClaw
       // produced no parseable response frame the run is treated as a
@@ -857,8 +999,8 @@ export async function handleDispatch(state, dispatch, liveness) {
       const finalText = extractStructuredText(result.stdout)
       if (!finalText) {
         const summary = 'OpenClaw returned no structured response frame; no customer content produced.'
-        await postConnectorEvent(state, finalEvent(state, dispatch, summary, true))
-        await acknowledgeTerminal(state, dispatch, {
+        await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+        await acknowledgeImpl(state, dispatch, {
           protocolVersion: PROTOCOL,
           dispatchId: dispatch.id,
           state: 'failed',
@@ -869,19 +1011,60 @@ export async function handleDispatch(state, dispatch, liveness) {
         // OpenClaw 2026.7.1 emits one JSON envelope at process completion,
         // not NDJSON streaming frames. Emit one bounded structured delta so
         // the protocol remains status -> delta -> final -> ack.
-        await postConnectorEvent(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
-        await postConnectorEvent(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
+        await postEventImpl(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
+        await postEventImpl(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
         // HFA-004 — exact locked recovery transcript literal.
-        await acknowledgeTerminal(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' }, liveness)
+        await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' }, liveness)
       }
     }
+  } catch (error) {
+    // Once a dispatch is claimed, every failure must converge through the
+    // same durable terminal boundary. If acknowledgement intent already
+    // exists, leave it untouched for restart-safe idempotent delivery.
+    const hasTerminalIntent = pendingTerminalOutbox(root)
+      .some((acknowledgement) => acknowledgement.dispatchId === dispatch.id)
+      || Boolean(state.pendingAcks?.[dispatch.id])
+    if (!readTerminalRecord(root, dispatch.id) && !hasTerminalIntent) {
+      const detail = error instanceof Error ? error.message : String(error)
+      const terminalCode = phase === 'admission'
+        ? lane === 'run' ? 'helm_link_run_contract_invalid' : 'helm_link_chat_admission_failed'
+        : phase === 'claim-registration' ? 'helm_link_claim_registration_failed' : 'openclaw_invocation_failed'
+      const summary = `Claimed ${lane} dispatch failed during ${phase}: ${detail}`.slice(0, 500)
+      journal('post_claim_terminal_selected', {
+        dispatchId: dispatch.id,
+        bindingId: state.bindingId,
+        phase,
+        terminalCode,
+      })
+      try {
+        await postEventImpl(state, finalEvent(state, dispatch, summary, true))
+      } catch (eventError) {
+        journal('terminal_event_delivery_failed', {
+          dispatchId: dispatch.id,
+          bindingId: state.bindingId,
+          errorCode: eventError?.code || null,
+        })
+      }
+      await acknowledgeImpl(state, dispatch, {
+        protocolVersion: PROTOCOL,
+        dispatchId: dispatch.id,
+        state: 'failed',
+        terminalCode,
+        terminalSummary: summary,
+      }, liveness)
+      return
+    }
+    throw error
   } finally {
-    await runBoundedCleanup(invocation.cleanup)
-    liveness.activeDispatchId = null
-    liveness.activeGatewayRunId = null
-    liveness.cancellation = null
-    liveness.activeDispatchStartedAt = null
-    delete state.activeInvocationId
+    try {
+      if (invocation) await runBoundedCleanup(invocation.cleanup)
+    } finally {
+      liveness.activeDispatchId = null
+      liveness.activeGatewayRunId = null
+      liveness.cancellation = null
+      liveness.activeDispatchStartedAt = null
+      delete state.activeInvocationId
+    }
   }
 }
 
@@ -1315,7 +1498,11 @@ export async function runConnectorLoops(state, options = {}) {
   }
   const presenceLoop = async () => {
     while (!stopped()) {
-      try { await presenceImpl(state, liveness, deriveLivenessPresence(liveness), telemetry) }
+      try {
+        await presenceImpl(state, liveness, deriveLivenessPresence(liveness), telemetry)
+        state.lastSuccessfulHeartbeatAt = new Date().toISOString()
+        saveState(state)
+      }
       catch (error) { console.error(`[helm-link] presence failed: ${error.message}`) }
       await pause(presenceMs)
     }
@@ -1482,14 +1669,26 @@ function sleep(ms) {
 
 async function status() {
   const state = loadState()
+  const service = platform() === 'darwin' ? connectorStatus() : null
   console.log(JSON.stringify(state ? {
-    connected: true,
+    connected: service ? service.connected : false,
+    locallyPaired: state.status === 'paired',
+    serverReachable: service ? service.serverReachable : false,
+    heartbeatAccepted: service ? service.heartbeatAccepted : false,
+    processRunning: service ? service.processRunning : false,
+    serviceEnabled: service ? service.serviceEnabled : false,
+    runtimeComplete: service ? service.runtimeComplete : false,
     server: state.server,
     bindingId: state.bindingId,
     runtimeAgentId: state.runtimeAgentId,
+    helmAgentId: state.helmAgentId,
     keyId: state.keyId,
+    connectorVersion: VERSION,
+    lastSuccessfulHeartbeatAt: state.lastSuccessfulHeartbeatAt || null,
+    actionableFailureReason: service?.actionableFailureReason || null,
     stateFile: STATE_FILE,
-  } : { connected: false, stateFile: STATE_FILE }, null, 2))
+  } : { connected: false, locallyPaired: false, stateFile: STATE_FILE }, null, 2))
+  if (service && !service.connected) process.exitCode = 1
 }
 
 async function disconnect() {

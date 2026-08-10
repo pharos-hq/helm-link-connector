@@ -4,9 +4,13 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -18,7 +22,7 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.2.0')
+  assert.equal(manifest.version, '0.2.6')
   assert.equal(Object.keys(manifest.files).length, 12)
 
   const expectedFiles = [
@@ -57,15 +61,15 @@ try {
   assert.match(workflow, /tags:\s*\n\s*- 'helm-link-connector-v\*'/)
   assert.match(workflow, /id-token: write/)
   assert.match(workflow, /--provenance/)
-  assert.doesNotMatch(workflow, /0\.2\.0-architecture\.\d+/,
+  assert.doesNotMatch(workflow, /0\.2\.1-architecture\.\d+/,
     'architecture candidate must not appear in the publication workflow')
   assert.doesNotMatch(
     workflow,
     /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|npm login|npm adduser/,
   )
-  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.0\.tgz/)
+  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.6\.tgz/)
   assert.match(workflow, new RegExp(manifest.archive.sha256))
-  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.0'/)
+  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.6'/)
   assert.match(workflow, /helm-link" doctor --agent fixture-agent/)
 
   const installRoot = temporaryDirectory('helm-link-install-')
@@ -114,12 +118,86 @@ try {
     'fixture-agent',
   )
 
+  const packedLifecycleRoot = temporaryDirectory('helm-link-packed-lifecycle-')
+  const packedStateDir = join(packedLifecycleRoot, 'state')
+  const packedLaunchAgents = join(packedLifecycleRoot, 'LaunchAgents')
+  const packedLaunchctlLog = join(packedLifecycleRoot, 'launchctl.log')
+  const fakeLaunchctl = join(packedLifecycleRoot, 'launchctl')
+  mkdirSync(packedStateDir, { recursive: true, mode: 0o700 })
+  writeFileSync(join(packedStateDir, 'state.json'), JSON.stringify({
+    status: 'paired',
+    runtimeAgentId: 'forge',
+    helmAgentId: '00000000-0000-4000-8000-000000000071',
+    bindingId: '00000000-0000-4000-8000-000000000172',
+  }), { mode: 0o600 })
+  writeFileSync(fakeLaunchctl, `#!/bin/sh
+printf '%s\\n' "$*" >> "${packedLaunchctlLog}"
+if [ "$1" = "print-disabled" ]; then
+  printf 'disabled services = {\\n'
+  if [ "$HELM_LINK_FAKE_LAUNCHD_DISABLED" = "1" ]; then
+    printf '  "com.pharos.helm-link" => disabled\\n'
+  else
+    printf '  "com.pharos.helm-link" => enabled\\n'
+  fi
+  printf '}\\n'
+  exit 0
+fi
+if [ "$1" = "print" ]; then
+  if [ "$HELM_LINK_FAKE_LAUNCHD_NOT_FOUND" = "1" ]; then
+    printf 'Could not find service "com.pharos.helm-link" in domain for uid\\n' >&2
+    exit 113
+  fi
+  printf 'state = exited\\n'
+  exit 0
+fi
+exit 0
+`, { mode: 0o700 })
+  chmodSync(fakeLaunchctl, 0o700)
+  const lifecycleEnv = {
+    ...process.env,
+    HELM_LINK_STATE_DIR: packedStateDir,
+    HELM_LINK_LAUNCH_AGENTS_DIR: packedLaunchAgents,
+    HELM_LINK_LAUNCHCTL_BIN: fakeLaunchctl,
+    HELM_LINK_OPENCLAW_BIN: fixture,
+  }
+  const installedCli = join(installRoot, 'node_modules/.bin/helm-link')
+  for (const [key, value] of Object.entries(lifecycleEnv)) process.env[key] = value
+  const packedModule = await import(join(installRoot, 'node_modules/@pharos-hq/helm-link-connector/bin/helm-link.mjs'))
+  const packedInstall = packedModule.installService({ platformName: 'darwin' })
+  assert.equal(packedInstall.installed, true)
+  const packedRuntimeDependency = join(packedStateDir, 'runtime', '0.2.6', 'lib', 'lifecycle-journal.mjs')
+  assert.equal(existsSync(packedRuntimeDependency), true)
+  process.env.HELM_LINK_FAKE_LAUNCHD_DISABLED = '1'
+  process.env.HELM_LINK_FAKE_LAUNCHD_NOT_FOUND = '1'
+  const disabledNotFoundStatus = packedModule.connectorStatus({ platformName: 'darwin' })
+  assert.equal(disabledNotFoundStatus.connected, false)
+  assert.equal(disabledNotFoundStatus.installed, true)
+  assert.equal(disabledNotFoundStatus.serviceEnabled, false)
+  assert.equal(disabledNotFoundStatus.processRunning, false)
+  assert.equal(disabledNotFoundStatus.pid, null)
+  assert.match(disabledNotFoundStatus.actionableFailureReason, /disabled/i)
+  delete process.env.HELM_LINK_FAKE_LAUNCHD_DISABLED
+  delete process.env.HELM_LINK_FAKE_LAUNCHD_NOT_FOUND
+  const stoppedStatusJson = packedModule.connectorStatus({ platformName: 'darwin' })
+  assert.equal(stoppedStatusJson.connected, false)
+  assert.equal(stoppedStatusJson.installed, true)
+  assert.equal(stoppedStatusJson.serviceEnabled, true)
+  assert.equal(stoppedStatusJson.processRunning, false)
+  assert.equal(stoppedStatusJson.heartbeatAccepted, false)
+  assert.equal(stoppedStatusJson.runtimeComplete, true)
+  unlinkSync(packedRuntimeDependency)
+  const missingRuntimeJson = packedModule.connectorStatus({ platformName: 'darwin' })
+  assert.equal(missingRuntimeJson.connected, false)
+  assert.equal(missingRuntimeJson.runtimeComplete, false)
+  assert.match(missingRuntimeJson.actionableFailureReason, /runtime is incomplete/i)
+
   console.log('VERIFIED source manifest declares 12 audited package files')
-  console.log('VERIFIED release candidate 0.2.0 is not wired to publication')
+  console.log('VERIFIED release candidate 0.2.6 is wired only to tag-bound publication')
   console.log(`VERIFIED reproducible release SHA-256: ${first.hash}`)
-  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.0')
+  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.6')
   console.log('VERIFIED exact cold-cache registry install gate')
   console.log('VERIFIED installed CLI doctor contract')
+  console.log('VERIFIED packed artifact lifecycle detects stopped service and missing runtime dependency')
 } finally {
   for (const directory of temporaryDirectories) {
     rmSync(directory, { recursive: true, force: true })
