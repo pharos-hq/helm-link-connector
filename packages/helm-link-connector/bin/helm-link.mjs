@@ -1461,6 +1461,19 @@ async function runLoop() {
   if (!state) throw new Error('No connector state. Run connect first.')
   migrateProcessedLedger(STATE_DIR, state)
   try {
+    await acquireBindingFence(state)
+    // A connector restart must converge durable terminal intent before it may
+    // acquire new work. Failure is terminal for this process attempt: the
+    // supervisor can retry, but the acquisition loop never opens while a
+    // terminal boundary is unresolved.
+    await convergeStartupTerminals(
+      state,
+      listInvocationClaims(STATE_DIR),
+      {
+        lastPollCompletedAt: 0, lastDispatchProgressAt: 0,
+        activeDispatchId: null, queueDepth: 0,
+      },
+    )
     try {
       await preflightOpenClawAgentCompatibility()
       if (state.openclawCompatibilityFailure) {
@@ -1476,19 +1489,6 @@ async function runLoop() {
       saveState(state)
       throw error
     }
-    await acquireBindingFence(state)
-    // A connector restart must converge durable terminal intent before it may
-    // acquire new work. Failure is terminal for this process attempt: the
-    // supervisor can retry, but the acquisition loop never opens while a
-    // terminal boundary is unresolved.
-    await convergeStartupTerminals(
-      state,
-      listInvocationClaims(STATE_DIR),
-      {
-        lastPollCompletedAt: 0, lastDispatchProgressAt: 0,
-        activeDispatchId: null, queueDepth: 0,
-      },
-    )
     await runConnectorLoops(state)
   } catch (error) {
     throw mapTerminalConnectorError(error, state)

@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      EXPECTED_SHA256: b2a342ba03729067a7f36eb14d88ffea9091cccdec09a6a48ff3ca4cf679b53f
+      EXPECTED_SHA256: a4b758f8731064dc607cb60ba0fe2c3b46372e393a89b8e5652226d1d8236f3f
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
