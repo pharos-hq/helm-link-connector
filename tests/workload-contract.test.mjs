@@ -13,7 +13,7 @@ chat.cleanup()
 const run = operationalArgs('agent', 'binding', 'dispatch', 'Build this feature.', validateRunContract({
   kind: 'run', capabilities: ['filesystem'], deadlineMs: 60_000,
   cancellation: 'terminal-no-replay', progress: 'durable-events', output: 'durable-terminal',
-}))
+}), new Date(Date.now() + 60_000).toISOString())
 assert.match(run.args.join(' '), /helm-run:binding:dispatch/)
 assert.equal(run.timeoutMs, 65_000)
 run.cleanup()

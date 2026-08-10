@@ -54,10 +54,13 @@ const operational = operationalArgs('fixture-agent', 'binding-123',
     progress: 'durable-events', cancellation: 'terminal-no-replay', output: 'durable-terminal',
   }, new Date(Date.now() + 60_000).toISOString())
 try {
-  assert.deepEqual(operational.args.slice(operational.args.indexOf('--run-id'), operational.args.indexOf('--run-id') + 2),
-    ['--run-id', '00000000-0000-4000-8000-000000000099'])
-  assert.ok(operational.args.includes('--queue-deadline-at'))
-  assert.ok(operational.args.includes('--execution-timeout-ms'))
+  assert.match(operational.args.join(' '), /helm-run:binding-123:00000000-0000-4000-8000-000000000099/)
+  assert.ok(operational.args.includes('--message-file'))
+  assert.ok(operational.args.includes('--timeout'))
+  assert.ok(operational.args.includes('--json'))
+  assert.ok(!operational.args.includes('--run-id'))
+  assert.ok(!operational.args.includes('--queue-deadline-at'))
+  assert.ok(!operational.args.includes('--execution-timeout-ms'))
 } finally { operational.cleanup() }
 
 const cancelResult = await cancelGatewayAgentRun({ runtimeAgentId: 'fixture-agent', bindingId: 'binding-123' },
