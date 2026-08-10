@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.4'
+const VERSION = '0.2.5'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -506,8 +506,8 @@ function launchdProcessFromOutput(output) {
 
 function launchdServiceDisabledFromOutput(output, label = SERVICE_LABEL) {
   const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const match = output.match(new RegExp(`["']?${escapedLabel}["']?\\s*(?:=>|=)\\s*(true|false)\\b`))
-  return match ? match[1] === 'true' : null
+  const match = output.match(new RegExp(`["']?${escapedLabel}["']?\\s*(?:=>|=)\\s*(true|false|enabled|disabled)\\b`))
+  return match ? ['true', 'disabled'].includes(match[1]) : null
 }
 
 function pidIsRunning(pid) {

@@ -1,21 +1,21 @@
 {
   "schemaVersion": 1,
   "package": "@pharos-hq/helm-link-connector",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "reviewedPredecessorCommit": "1e6a60d",
   "archive": {
-    "filename": "pharos-hq-helm-link-connector-0.2.4.tgz",
-    "sha256": "a4e19037f0b2b52afba5fd8cd263b22970b1b7c9ccef2ce272ee0063857a6889"
+    "filename": "pharos-hq-helm-link-connector-0.2.5.tgz",
+    "sha256": "395b75e79449d965d4366125c3b5a739d3c0d12dfd59868042eeb4dc5fa3496c"
   },
   "files": {
     "packages/helm-link-connector/LICENSE": "b65e3c1127db9c0ecee1f0cbf48e609422ba1555d389b759199d47c5bd13f3ac",
-    "packages/helm-link-connector/README.md": "85abc31fd842bfb3a306a7a6f944fbf83e300871ef9fdf0b87e33809e3c1bbbc",
-    "packages/helm-link-connector/bin/helm-link.mjs": "dae0503767e089e6a6edf0d429700ee6ca9ff37a9f50d1544f25d1d85ed33a1f",
+    "packages/helm-link-connector/README.md": "964ea670a5d71a8f074fd0a562d7793aeb63ae653ea4e3f21f9935d9e1ebc378",
+    "packages/helm-link-connector/bin/helm-link.mjs": "9c23874e69d872cf2870db36a336fb9b9ccfa40deb75c0fe5d58c59fb007e8d8",
     "packages/helm-link-connector/lib/invocation-claims.mjs": "b46eb7a40205517824a04a89362c0e9d5f7f407dbbdfe31cfdbfb5bf745980d0",
     "packages/helm-link-connector/lib/lifecycle-journal.mjs": "e6b8e06615ac9b1ca6a365955716ebeec90239f199dc710b86c21296f7dcfbf9",
     "packages/helm-link-connector/lib/terminal-store.mjs": "d79f7fc16c3852fc484a11015d700e386d922344c9dc648b858c8c8df970f216",
     "packages/helm-link-connector/lib/workload-contract.mjs": "54acab14a7ff0c20175e24dd9dbda10b40c4616f5db53f5d188d64c2fed0c49e",
-    "packages/helm-link-connector/package.json": "03c7d404f5174f6cbe22e0ac46ba6e1c10f7da86b855a9203215f042ec36fc21",
+    "packages/helm-link-connector/package.json": "afbbd4795837ab68dd8b6dcca50120baf1c7deaa19884dc5ff32593ae03f3ddc",
     "packages/helm-link-connector/supervisors/container/docker-compose.yml": "4b43486c057c393dabb78c54757fd3a07e899b5e8d57e0cf7a90c223b332249b",
     "packages/helm-link-connector/supervisors/launchd/com.helm.link.plist": "7b3a7865405f05d7011cc28c000c50bd2207eeac851d26fceecc50d67fa20e05",
     "packages/helm-link-connector/supervisors/run-supervised.sh": "6886b0c1e1f6826a3a04807128799b5ba8696e3ea63e61b7237783f8eeb13910",
