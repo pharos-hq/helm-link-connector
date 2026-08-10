@@ -18,7 +18,7 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.2.0')
+  assert.equal(manifest.version, '0.2.1')
   assert.equal(Object.keys(manifest.files).length, 12)
 
   const expectedFiles = [
@@ -57,15 +57,15 @@ try {
   assert.match(workflow, /tags:\s*\n\s*- 'helm-link-connector-v\*'/)
   assert.match(workflow, /id-token: write/)
   assert.match(workflow, /--provenance/)
-  assert.doesNotMatch(workflow, /0\.2\.0-architecture\.\d+/,
+  assert.doesNotMatch(workflow, /0\.2\.1-architecture\.\d+/,
     'architecture candidate must not appear in the publication workflow')
   assert.doesNotMatch(
     workflow,
     /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|npm login|npm adduser/,
   )
-  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.0\.tgz/)
+  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.1\.tgz/)
   assert.match(workflow, new RegExp(manifest.archive.sha256))
-  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.0'/)
+  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.1'/)
   assert.match(workflow, /helm-link" doctor --agent fixture-agent/)
 
   const installRoot = temporaryDirectory('helm-link-install-')
@@ -115,9 +115,9 @@ try {
   )
 
   console.log('VERIFIED source manifest declares 12 audited package files')
-  console.log('VERIFIED release candidate 0.2.0 is not wired to publication')
+  console.log('VERIFIED release candidate 0.2.1 is not wired to publication')
   console.log(`VERIFIED reproducible release SHA-256: ${first.hash}`)
-  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.0')
+  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.1')
   console.log('VERIFIED exact cold-cache registry install gate')
   console.log('VERIFIED installed CLI doctor contract')
 } finally {
