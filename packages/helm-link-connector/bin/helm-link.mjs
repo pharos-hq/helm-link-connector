@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.6'
+const VERSION = '0.2.7'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -176,23 +176,55 @@ export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false
 export function operationalArgs(agentId, bindingId, dispatchId, text, contract, expiresAt) {
   const run = validateRunContract(contract)
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
+  const parsedExpiry = Date.parse(expiresAt)
+  if (!Number.isFinite(parsedExpiry)) throw new Error('Durable Run queue deadline is invalid.')
+  const queueRemainingMs = parsedExpiry - Date.now()
+  if (queueRemainingMs <= 0) throw new Error('Durable Run queue deadline elapsed before OpenClaw invocation.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-run-'))
   const file = join(dir, 'message.txt')
   writePrivate(file, text)
-  const parsedExpiry = Date.parse(expiresAt)
-  const queueDeadlineAt = Number.isFinite(parsedExpiry) ? parsedExpiry : Date.now()
-  const queueRemainingMs = Math.max(0, queueDeadlineAt - Date.now())
+  const executionTimeoutSeconds = Math.max(1, Math.floor(run.deadlineMs / 1000))
   return {
     args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-run:${bindingId}:${dispatchId}`,
-      '--run-id', dispatchId, '--queue-deadline-at', String(queueDeadlineAt),
-      '--execution-timeout-ms', String(run.deadlineMs), '--message-file', file,
-      '--timeout', String(Math.ceil((run.deadlineMs + queueRemainingMs) / 1000)), '--json'],
-    timeoutMs: run.deadlineMs + queueRemainingMs + 5_000,
+      '--message-file', file, '--timeout', String(executionTimeoutSeconds), '--json'],
+    // OpenClaw 2026.7.1 does not expose Helm's run-id or queue/deadline
+    // options. Run identity remains fenced by the dispatch-scoped session key
+    // and local invocation claim. The supported CLI timeout plus this parent
+    // timer enforce the execution deadline independently of the child.
+    timeoutMs: run.deadlineMs + 5_000,
+    queueDeadlineAt: parsedExpiry,
+    executionTimeoutMs: run.deadlineMs,
     cleanup() {
       try { unlinkSync(file) } catch {}
       try { rmSync(dir, { recursive: true, force: true }) } catch {}
     },
   }
+}
+
+const REQUIRED_OPENCLAW_AGENT_OPTIONS = ['--agent', '--message-file', '--session-key', '--timeout', '--json']
+
+export function inspectOpenClawAgentHelp(helpText) {
+  const help = String(helpText || '')
+  const missing = REQUIRED_OPENCLAW_AGENT_OPTIONS.filter((option) => !help.includes(option))
+  return { compatible: missing.length === 0, missing, required: [...REQUIRED_OPENCLAW_AGENT_OPTIONS] }
+}
+
+export async function preflightOpenClawAgentCompatibility({ runImpl = runOpenClawAdvisory } = {}) {
+  const result = await runImpl({
+    args: ['agent', '--help'],
+    timeoutMs: 10_000,
+    outputLimit: 100_000,
+    stderrLimit: 25_000,
+  })
+  if (result.terminationCause !== 'completed') {
+    const detail = sanitizeRuntimeError(result.stderr)
+    throw new Error(`OpenClaw agent compatibility preflight failed${detail ? `: ${detail}` : ` (${result.terminationCause || 'unknown failure'})`}.`)
+  }
+  const report = inspectOpenClawAgentHelp(result.stdout)
+  if (!report.compatible) {
+    throw new Error(`OpenClaw agent compatibility preflight failed: missing required options ${report.missing.join(', ')}. Upgrade OpenClaw or install a connector version compatible with this runtime.`)
+  }
+  return report
 }
 
 function canonical(value) {
@@ -602,6 +634,7 @@ export function connectorStatus({ platformName = platform(), nowMs = Date.now() 
     ? 'LaunchAgent is installed but disabled. Run helm-link install-service to enable and restart it.'
     : 'LaunchAgent enabled state could not be verified. Run helm-link install-service to refresh the supervised runtime.'
   else if (!runtimeComplete) actionableFailureReason = 'LaunchAgent runtime is incomplete. Run helm-link install-service to reinstall the packaged connector runtime.'
+  else if (state.openclawCompatibilityFailure?.summary) actionableFailureReason = state.openclawCompatibilityFailure.summary
   else if (!processRunning) actionableFailureReason = 'LaunchAgent is installed but the connector process is not running. Run helm-link install-service to refresh the supervised runtime.'
   else if (!locallyPaired) actionableFailureReason = 'Local connector state is not paired. Reconnect in Helm with a fresh enrollment.'
   else if (!heartbeatAccepted) actionableFailureReason = 'No recent server-accepted heartbeat. Wait for the connector to reach Helm or reconnect if the server binding is stale.'
@@ -878,6 +911,20 @@ function gatewayEnvelopeOutcome(stdout) {
   }
 }
 
+export function sanitizeRuntimeError(value, limit = 400) {
+  return sanitizeCustomerText(value, limit * 3)
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\b(?:gh[pousr]_|sk_(?:live|test)_|xox[baprs]-|AKIA)[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PAT))=([^\s]+)/g, '$1=[redacted]')
+    .replace(/([?&](?:token|key|secret|signature)=)[^&\s]+/gi, '$1[redacted]')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .slice(0, limit)
+}
+
 export async function handleDispatch(state, dispatch, liveness, options = {}) {
   const root = options.root ?? STATE_DIR
   const registerClaimImpl = options.registerClaimImpl ?? registerInvocationClaim
@@ -989,7 +1036,13 @@ export async function handleDispatch(state, dispatch, liveness, options = {}) {
         spawn_error: ['openclaw_spawn_error', 'OpenClaw could not be spawned; no customer content produced.'],
         close_timeout: ['openclaw_close_timeout', 'OpenClaw did not close within its external bound; no customer content produced.'],
       }
-      const [terminalCode, summary] = terminalByCause[result.terminationCause] || ['openclaw_failed', 'OpenClaw advisory failed; no customer content produced.']
+      const [terminalCode, genericSummary] = terminalByCause[result.terminationCause] || ['openclaw_failed', 'OpenClaw advisory failed; no customer content produced.']
+      const runtimeDetail = result.terminationCause === 'nonzero_exit'
+        ? sanitizeRuntimeError(result.stderr)
+        : ''
+      const summary = runtimeDetail
+        ? `OpenClaw exited nonzero: ${runtimeDetail}`.slice(0, 500)
+        : genericSummary
       await postEventImpl(state, finalEvent(state, dispatch, summary, true))
       await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'failed', terminalCode, terminalSummary: summary }, liveness)
     } else {
@@ -1408,6 +1461,21 @@ async function runLoop() {
   if (!state) throw new Error('No connector state. Run connect first.')
   migrateProcessedLedger(STATE_DIR, state)
   try {
+    try {
+      await preflightOpenClawAgentCompatibility()
+      if (state.openclawCompatibilityFailure) {
+        delete state.openclawCompatibilityFailure
+        saveState(state)
+      }
+    } catch (error) {
+      state.openclawCompatibilityFailure = {
+        code: 'openclaw_agent_cli_incompatible',
+        summary: sanitizeRuntimeError(error instanceof Error ? error.message : String(error), 500),
+        observedAt: new Date().toISOString(),
+      }
+      saveState(state)
+      throw error
+    }
     await acquireBindingFence(state)
     // A connector restart must converge durable terminal intent before it may
     // acquire new work. Failure is terminal for this process attempt: the

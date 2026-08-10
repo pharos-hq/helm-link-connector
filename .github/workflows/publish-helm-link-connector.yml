@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      EXPECTED_SHA256: 07f95407278f8f801839f92eb7bc630c222410eedf00361a843f4b06c4d6ac6d
+      EXPECTED_SHA256: b2a342ba03729067a7f36eb14d88ffea9091cccdec09a6a48ff3ca4cf679b53f
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -32,7 +32,7 @@ jobs:
           package_name="$(node -p "require('./packages/helm-link-connector/package.json').name")"
           package_version="$(node -p "require('./packages/helm-link-connector/package.json').version")"
           test "$package_name" = '@pharos-hq/helm-link-connector'
-          test "$package_version" = '0.2.6'
+          test "$package_version" = '0.2.7'
           test "$GITHUB_REF_NAME" = "helm-link-connector-v${package_version}"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           npm test
@@ -41,31 +41,31 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/package-helm-link-connector.mjs --out-dir /tmp/helm-link-publish
-          archive=/tmp/helm-link-publish/pharos-hq-helm-link-connector-0.2.6.tgz
+          archive=/tmp/helm-link-publish/pharos-hq-helm-link-connector-0.2.7.tgz
           test "$(find /tmp/helm-link-publish -maxdepth 1 -name '*.tgz' | wc -l | tr -d ' ')" = 1
           test "$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_SHA256"
           (cd /tmp/helm-link-publish && sha256sum --check SHA256SUMS)
       - name: Publish public package with npm provenance
-        run: npm publish /tmp/helm-link-publish/pharos-hq-helm-link-connector-0.2.6.tgz --access public --tag latest --provenance
+        run: npm publish /tmp/helm-link-publish/pharos-hq-helm-link-connector-0.2.7.tgz --access public --tag latest --provenance
       - name: Verify registry integrity, tags, and attestation receipt
         shell: bash
         run: |
           set -euo pipefail
           for attempt in $(seq 1 12); do
-            version="$(npm view '@pharos-hq/helm-link-connector@0.2.6' version 2>/dev/null || true)"
-            if [[ "$version" = '0.2.6' ]]; then break; fi
+            version="$(npm view '@pharos-hq/helm-link-connector@0.2.7' version 2>/dev/null || true)"
+            if [[ "$version" = '0.2.7' ]]; then break; fi
             sleep 5
           done
-          test "$version" = '0.2.6'
-          test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.2.6'
-          npm view '@pharos-hq/helm-link-connector@0.2.6' dist.integrity dist.shasum dist.attestations --json
+          test "$version" = '0.2.7'
+          test "$(npm view '@pharos-hq/helm-link-connector' dist-tags.latest)" = '0.2.7'
+          npm view '@pharos-hq/helm-link-connector@0.2.7' dist.integrity dist.shasum dist.attestations --json
       - name: Verify exact cold-cache registry install
         shell: bash
         run: |
           set -euo pipefail
           install_root="$(mktemp -d)"
           cache_root="$(mktemp -d)"
-          npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "$cache_root" --prefix "$install_root" '@pharos-hq/helm-link-connector@0.2.6'
+          npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "$cache_root" --prefix "$install_root" '@pharos-hq/helm-link-connector@0.2.7'
           HELM_LINK_STATE_DIR="$install_root/state" \
           HELM_LINK_OPENCLAW_BIN="$GITHUB_WORKSPACE/tests/fixtures/fake-openclaw.mjs" \
             "$install_root/node_modules/.bin/helm-link" doctor --agent fixture-agent
