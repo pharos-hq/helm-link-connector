@@ -15,19 +15,27 @@ const fakeOpenClaw = resolve('tests/fixtures/fake-openclaw.mjs')
 
 writeFileSync(fakeLaunchctl, `#!/bin/sh
 printf '%s\\n' "$*" >> "${launchctlLog}"
+if [ "$1" = "print-disabled" ]; then
+  printf 'disabled services = {\\n'
+  if [ "$HELM_LINK_FAKE_LAUNCHD_DISABLED" = "1" ]; then
+    printf '  "com.pharos.helm-link" => true\\n'
+  else
+    printf '  "com.pharos.helm-link" => false\\n'
+  fi
+  printf '}\\n'
+  exit 0
+fi
 if [ "$1" = "print" ]; then
+  if [ "$HELM_LINK_FAKE_LAUNCHD_NOT_FOUND" = "1" ]; then
+    printf 'Could not find service "com.pharos.helm-link" in domain for uid\\n' >&2
+    exit 113
+  fi
   if [ -n "$HELM_LINK_FAKE_LAUNCHD_PID" ]; then
     printf 'state = running\\n'
     printf 'pid = %s\\n' "$HELM_LINK_FAKE_LAUNCHD_PID"
-    if [ "$HELM_LINK_FAKE_LAUNCHD_DISABLED" = "1" ]; then
-      printf 'disabled = true\\n'
-    fi
     exit 0
   fi
   printf 'state = exited\\n'
-  if [ "$HELM_LINK_FAKE_LAUNCHD_DISABLED" = "1" ]; then
-    printf 'disabled = true\\n'
-  fi
   exit 0
 fi
 exit 0
@@ -46,9 +54,9 @@ writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ status: 'paired' })
 const first = installService({ platformName: 'darwin' })
 const second = installService({ platformName: 'darwin' })
 assert.equal(first.installed, true)
-assert.equal(second.version, '0.2.3')
-assert.equal(existsSync(join(stateDir, 'runtime', '0.2.3', 'bin', 'helm-link.mjs')), true)
-assert.equal(existsSync(join(stateDir, 'runtime', '0.2.3', 'lib', 'lifecycle-journal.mjs')), true)
+assert.equal(second.version, '0.2.4')
+assert.equal(existsSync(join(stateDir, 'runtime', '0.2.4', 'bin', 'helm-link.mjs')), true)
+assert.equal(existsSync(join(stateDir, 'runtime', '0.2.4', 'lib', 'lifecycle-journal.mjs')), true)
 
 const plist = readFileSync(first.plist, 'utf8')
 assert.match(plist, /<key>RunAtLoad<\/key><true\/>/)
@@ -86,17 +94,18 @@ assert.equal(staleStatus.heartbeatAccepted, false)
 assert.match(staleStatus.actionableFailureReason, /not running/i)
 
 process.env.HELM_LINK_FAKE_LAUNCHD_DISABLED = '1'
-process.env.HELM_LINK_FAKE_LAUNCHD_PID = String(process.pid)
+process.env.HELM_LINK_FAKE_LAUNCHD_NOT_FOUND = '1'
 const disabledStatus = connectorStatus({ platformName: 'darwin' })
 assert.equal(disabledStatus.connected, false)
 assert.equal(disabledStatus.installed, true)
 assert.equal(disabledStatus.serviceEnabled, false)
-assert.equal(disabledStatus.processRunning, true)
+assert.equal(disabledStatus.processRunning, false)
+assert.equal(disabledStatus.pid, null)
 assert.match(disabledStatus.actionableFailureReason, /disabled/i)
 delete process.env.HELM_LINK_FAKE_LAUNCHD_DISABLED
-delete process.env.HELM_LINK_FAKE_LAUNCHD_PID
+delete process.env.HELM_LINK_FAKE_LAUNCHD_NOT_FOUND
 
-rmSync(join(stateDir, 'runtime', '0.2.3', 'lib', 'lifecycle-journal.mjs'))
+rmSync(join(stateDir, 'runtime', '0.2.4', 'lib', 'lifecycle-journal.mjs'))
 process.env.HELM_LINK_FAKE_LAUNCHD_PID = String(process.pid)
 const incompleteRuntimeStatus = connectorStatus({ platformName: 'darwin' })
 assert.equal(incompleteRuntimeStatus.connected, false)
@@ -122,7 +131,7 @@ assert.equal(liveStatus.serverReachable, true)
 assert.equal(liveStatus.heartbeatAccepted, true)
 assert.equal(liveStatus.runtimeComplete, true)
 assert.equal(liveStatus.boundRuntimeAgentId, 'forge')
-assert.equal(liveStatus.connectorVersion, '0.2.3')
+assert.equal(liveStatus.connectorVersion, '0.2.4')
 
 const uninstall = uninstallService({ platformName: 'darwin' })
 assert.equal(uninstall.uninstalled, true)

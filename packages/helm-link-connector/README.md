@@ -7,12 +7,12 @@ OpenClaw agent to Helm Link.
 
 Helm generates a private connection command pinned to an exact public package
 version. Never replace that version with `latest`, reuse an expired connection
-code, or paste or screenshot the command. Version `0.2.3` is the current
+code, or paste or screenshot the command. Version `0.2.4` is the current
 release candidate and is eligible for publication only through the
 repository's tag-bound GitHub OIDC workflow with npm provenance after an
 explicit release authorization gate.
 
-The `0.2.3` archive is prepared but the tag-bound publish workflow remains
+The `0.2.4` archive is prepared but the tag-bound publish workflow remains
 inert; the archive must not be installed on a live binding before that
 separate staging release gate.
 
@@ -23,7 +23,7 @@ hosted round trip. Follow `docs/HELM_LINK_SUPERVISED_PILOT_RUNBOOK.md` for the
 actual-custody gate.
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.2.3' doctor --agent your-openclaw-agent-id
+npx --yes '@pharos-hq/helm-link-connector@0.2.4' doctor --agent your-openclaw-agent-id
 ```
 
 Connection codes are intentionally omitted from documentation. Generate the
@@ -49,9 +49,9 @@ For an already paired Mac, install supervision without replacing the binding,
 key, transcript, or local state:
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.2.3' install-service
-npx --yes '@pharos-hq/helm-link-connector@0.2.3' service-status
-npx --yes '@pharos-hq/helm-link-connector@0.2.3' uninstall-service
+npx --yes '@pharos-hq/helm-link-connector@0.2.4' install-service
+npx --yes '@pharos-hq/helm-link-connector@0.2.4' service-status
+npx --yes '@pharos-hq/helm-link-connector@0.2.4' uninstall-service
 ```
 
 ## Supervisor templates

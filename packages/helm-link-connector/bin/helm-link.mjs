@@ -27,7 +27,7 @@ import {
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.3'
+const VERSION = '0.2.4'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -498,12 +498,16 @@ export function uninstallService({ platformName = platform() } = {}) {
 function launchdProcessFromOutput(output) {
   const pid = Number(output.match(/(?:^|\n)\s*pid\s*=\s*(\d+)/)?.[1] || 0)
   const state = output.match(/(?:^|\n)\s*state\s*=\s*([^\n]+)/)?.[1]?.trim() || null
-  const disabled = /(?:^|\n)\s*disabled\s*=\s*true\b/.test(output)
   return {
     pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
     launchdState: state,
-    disabled,
   }
+}
+
+function launchdServiceDisabledFromOutput(output, label = SERVICE_LABEL) {
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = output.match(new RegExp(`["']?${escapedLabel}["']?\\s*(?:=>|=)\\s*(true|false)\\b`))
+  return match ? match[1] === 'true' : null
 }
 
 function pidIsRunning(pid) {
@@ -573,18 +577,26 @@ export function connectorStatus({ platformName = platform(), nowMs = Date.now() 
   }
   const target = `gui/${process.getuid()}/${SERVICE_LABEL}`
   const result = runLaunchctl(['print', target], { allowFailure: true })
+  const disabledResult = runLaunchctl(['print-disabled', `gui/${process.getuid()}`], { allowFailure: true })
   const launchd = launchdProcessFromOutput(result.stdout || '')
   const processRunning = pidIsRunning(launchd.pid)
   const heartbeatAccepted = latestHeartbeatFresh(state, nowMs)
-  const installed = result.status === 0
-  const serviceEnabled = Boolean(installed && !launchd.disabled)
+  const paths = servicePaths()
+  const runtimePresent = existsSync(paths.runtimeDir)
+  const installed = existsSync(paths.plist) && runtimePresent
+  const disabled = disabledResult.status === 0
+    ? launchdServiceDisabledFromOutput(disabledResult.stdout || '', SERVICE_LABEL)
+    : null
+  const serviceEnabled = Boolean(installed && disabled === false)
   const runtimeComplete = runtimeClosureComplete()
   const locallyPaired = state.status === 'paired'
   const connected = Boolean(installed && serviceEnabled && runtimeComplete && processRunning && locallyPaired && heartbeatAccepted)
   let actionableFailureReason = null
   if (state.status === 'revoked') actionableFailureReason = 'Server authority was revoked. Reconnect in Helm with a fresh enrollment.'
   else if (!installed) actionableFailureReason = 'LaunchAgent is not installed. Run helm-link install-service after pairing.'
-  else if (!serviceEnabled) actionableFailureReason = 'LaunchAgent is installed but disabled. Run helm-link install-service to enable and restart it.'
+  else if (!serviceEnabled) actionableFailureReason = disabled === true
+    ? 'LaunchAgent is installed but disabled. Run helm-link install-service to enable and restart it.'
+    : 'LaunchAgent enabled state could not be verified. Run helm-link install-service to refresh the supervised runtime.'
   else if (!runtimeComplete) actionableFailureReason = 'LaunchAgent runtime is incomplete. Run helm-link install-service to reinstall the packaged connector runtime.'
   else if (!processRunning) actionableFailureReason = 'LaunchAgent is installed but the connector process is not running. Run helm-link install-service to refresh the supervised runtime.'
   else if (!locallyPaired) actionableFailureReason = 'Local connector state is not paired. Reconnect in Helm with a fresh enrollment.'
@@ -598,6 +610,7 @@ export function connectorStatus({ platformName = platform(), nowMs = Date.now() 
     processRunning,
     pid: launchd.pid,
     launchdState: launchd.launchdState,
+    launchdDisabled: disabled,
     serverReachable: heartbeatAccepted,
     heartbeatAccepted,
     runtimeComplete,
