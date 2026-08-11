@@ -25,9 +25,17 @@ import {
   writeTerminalOutbox,
 } from '../lib/terminal-store.mjs'
 import { classifyWorkloadText, validateRunContract } from '../lib/workload-contract.mjs'
+import { markArtifactIntentDelivered, pendingArtifactIntents, writeArtifactIntent } from '../lib/artifact-outbox.mjs'
+import {
+  buildSignedArtifactEnvelope,
+  closeArtifactOutputRootHandle,
+  extractStructuredArtifactDeclarations,
+  openArtifactOutputRootHandle,
+  prepareArtifactOutputs,
+} from '../lib/artifact-contract.mjs'
 
 const PROTOCOL = 'helm-link.longpoll.v1'
-const VERSION = '0.2.7'
+const VERSION = '0.2.8'
 const STATE_DIR = process.env.HELM_LINK_STATE_DIR || join(homedir(), '.helm-link')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const LIFECYCLE_FILE = join(STATE_DIR, 'lifecycle.ndjson')
@@ -152,7 +160,7 @@ function runtimeModelForAgent(agentId) {
   }
 }
 
-export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false } = {}) {
+export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false, artifactOutputRoot = null } = {}) {
   // Lane selection is an explicit Helm dispatch contract, never a prompt
   // classifier. Ordinary connected OpenClaw agents keep their existing host
   // policy; Helm transports chat but grants no additional tool authority.
@@ -163,7 +171,7 @@ export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-message-'))
   const file = join(dir, 'message.txt')
-  writePrivate(file, text)
+  writePrivate(file, messageWithArtifactContract(text, artifactOutputRoot))
   return {
     args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-link:${bindingId}`, '--message-file', file, '--timeout', '120', '--json'],
     cleanup() {
@@ -173,7 +181,7 @@ export function advisoryArgs(agentId, bindingId, text, { noToolsAttested = false
   }
 }
 
-export function operationalArgs(agentId, bindingId, dispatchId, text, contract, expiresAt) {
+export function operationalArgs(agentId, bindingId, dispatchId, text, contract, expiresAt, { artifactOutputRoot = null } = {}) {
   const run = validateRunContract(contract)
   if (!/^[a-z0-9_-]{1,160}$/i.test(agentId)) throw new Error('Invalid OpenClaw agent id.')
   const parsedExpiry = Date.parse(expiresAt)
@@ -182,7 +190,7 @@ export function operationalArgs(agentId, bindingId, dispatchId, text, contract, 
   if (queueRemainingMs <= 0) throw new Error('Durable Run queue deadline elapsed before OpenClaw invocation.')
   const dir = mkdtempSync(join(tmpdir(), 'helm-link-run-'))
   const file = join(dir, 'message.txt')
-  writePrivate(file, text)
+  writePrivate(file, messageWithArtifactContract(text, artifactOutputRoot))
   const executionTimeoutSeconds = Math.max(1, Math.floor(run.deadlineMs / 1000))
   return {
     args: ['agent', '--agent', agentId, '--session-key', `agent:${agentId}:helm-run:${bindingId}:${dispatchId}`,
@@ -199,6 +207,11 @@ export function operationalArgs(agentId, bindingId, dispatchId, text, contract, 
       try { rmSync(dir, { recursive: true, force: true }) } catch {}
     },
   }
+}
+
+function messageWithArtifactContract(text, artifactOutputRoot) {
+  if (!artifactOutputRoot) return text
+  return `${text}\n\n---\nHELM VERIFIED OUTPUT BOUNDARY\nIf and only if the requested work produces files, write each file directly inside this connector-owned directory (no subdirectories, links, aliases, or external paths):\n${artifactOutputRoot}\nReturn each file only through the structured artifact declaration field with its absolute path, filename, and MIME type. A filename or Markdown link alone is not delivery.`
 }
 
 const REQUIRED_OPENCLAW_AGENT_OPTIONS = ['--agent', '--message-file', '--session-key', '--timeout', '--json']
@@ -302,6 +315,101 @@ export async function postJson(state, pathname, body, { timeoutMs = HTTP_REQUEST
 // from the authenticated route; callers cannot promote arbitrary requests.
 export async function postControlJson(state, pathname, body, options = {}) {
   return postJson(state, pathname, body, options)
+}
+
+export async function postBinary(state, pathname, body, { timeoutMs = HTTP_REQUEST_TIMEOUT_MS, fetchImpl = fetch } = {}) {
+  const raw = JSON.stringify(body)
+  const timestamp = new Date().toISOString()
+  const nonce = randomBytes(18).toString('base64url')
+  const hash = bodyHash(raw)
+  const signature = sign(null, Buffer.from(canonicalRequest('POST', pathname, state.bindingId, timestamp, nonce, hash)), state.privateKeyPem).toString('base64')
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetchImpl(new URL(pathname, state.server).toString(), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-helm-link-binding-id': state.bindingId,
+        'x-helm-link-timestamp': timestamp,
+        'x-helm-link-nonce': nonce,
+        'x-helm-link-body-sha256': hash,
+        'x-helm-link-signature': signature,
+      },
+      body: raw,
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      const failure = await response.json().catch(() => ({}))
+      throw new Error(failure.error || `HTTP ${response.status}`)
+    }
+    return Buffer.from(await response.arrayBuffer())
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function safeAttachmentFilename(value, ordinal) {
+  const normalized = String(value || `attachment-${ordinal}`)
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .replace(/^\.+/, '')
+    .slice(0, 180)
+  return `${String(ordinal).padStart(2, '0')}-${normalized || `attachment-${ordinal}`}`
+}
+
+export async function materializeInboundAttachments(state, dispatch, options = {}) {
+  const downloadImpl = options.downloadImpl ?? postBinary
+  const receiptImpl = options.receiptImpl ?? postJson
+  const references = Array.isArray(dispatch.payload?.attachments) ? dispatch.payload.attachments : []
+  if (references.length === 0) return { paths: [], cleanup() {} }
+  if (references.length > 10) throw new Error('Inbound attachment count exceeds the connector bound.')
+  const dir = mkdtempSync(join(tmpdir(), 'helm-link-inbound-'))
+  const paths = []
+  try {
+    for (const [index, reference] of references.entries()) {
+      const attachmentId = String(reference?.attachmentId || '')
+      const expectedHash = String(reference?.sha256 || '')
+      const expectedSize = Number(reference?.byteSize)
+      if (!/^[0-9a-f-]{36}$/i.test(attachmentId)
+        || !/^[a-f0-9]{64}$/.test(expectedHash)
+        || !Number.isSafeInteger(expectedSize)
+        || expectedSize <= 0
+        || expectedSize > 50 * 1024 * 1024) {
+        throw new Error('Inbound attachment envelope is invalid.')
+      }
+      const request = {
+        protocolVersion: PROTOCOL,
+        dispatchId: dispatch.id,
+        attachmentId,
+        deliveryFencingToken: Number(state.fencingToken || 0),
+      }
+      const bytes = await downloadImpl(state, '/api/helm-link/connector/attachments/download', request)
+      const actualHash = createHash('sha256').update(bytes).digest('hex')
+      if (bytes.byteLength !== expectedSize || actualHash !== expectedHash) {
+        throw new Error(`Inbound attachment failed checksum verification: ${attachmentId}`)
+      }
+      const path = join(dir, safeAttachmentFilename(reference.filename, index + 1))
+      writePrivate(path, bytes)
+      await receiptImpl(state, '/api/helm-link/connector/attachments/receipt', {
+        ...request,
+        byteSize: bytes.byteLength,
+        sha256: actualHash,
+      })
+      paths.push(path)
+    }
+    return {
+      paths,
+      cleanup() { try { rmSync(dir, { recursive: true, force: true }) } catch {} },
+    }
+  } catch (error) {
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+    throw error
+  }
+}
+
+export function appendInboundMediaDirectives(text, paths) {
+  if (!paths?.length) return text
+  return `${text}\n\n${paths.map(path => `MEDIA: \`${path}\``).join('\n')}`
 }
 
 async function doctor(args) {
@@ -852,6 +960,10 @@ export async function flushPendingAcks(state, liveness, {
 
 export async function convergeStartupTerminals(state, claims, liveness, options = {}) {
   const root = options.root ?? STATE_DIR
+  // A persisted artifact envelope means provider execution completed and file
+  // settlement may already be Ready remotely. Reconcile it before bare claims
+  // can be classified as ambiguous/Failed.
+  await flushArtifactSettlementOutbox(state, liveness, { ...options, root })
   // A durable acknowledgement intent is stronger evidence than a bare claim:
   // it proves execution reached the terminal-delivery boundary. Replay that
   // idempotent acknowledgement first so a lost HTTP response converges on the
@@ -933,11 +1045,17 @@ export async function handleDispatch(state, dispatch, liveness, options = {}) {
   const runImpl = options.runImpl ?? runOpenClawAdvisory
   const operationalArgsImpl = options.operationalArgsImpl ?? operationalArgs
   const advisoryArgsImpl = options.advisoryArgsImpl ?? advisoryArgs
+  const materializeAttachmentsImpl = options.materializeAttachmentsImpl ?? materializeInboundAttachments
   if (readTerminalRecord(root, dispatch.id)) return
   if (state.pendingAcks?.[dispatch.id]) {
     await flushPendingAcks(state, liveness, { root })
     return
   }
+  const artifactOutputParent = join(root, 'artifact-outputs')
+  mkdirPrivate(artifactOutputParent)
+  const artifactOutputRoot = mkdtempSync(join(artifactOutputParent, `${String(dispatch.id)}-`))
+  chmodSync(artifactOutputRoot, 0o700)
+  const artifactOutputRootHandle = openArtifactOutputRootHandle(artifactOutputRoot)
   const journal = createLifecycleJournal(options.lifecycleFile ?? LIFECYCLE_FILE)
   const invocationId = randomUUID()
   const claim = claimInvocation(root, {
@@ -950,6 +1068,7 @@ export async function handleDispatch(state, dispatch, liveness, options = {}) {
   const text = String(dispatch.payload?.text || '')
   const lane = dispatch.payload?.kind === 'run' ? 'run' : 'chat'
   let invocation = null
+  let inboundAttachments = null
   let phase = 'claim-registration'
   state.activeInvocationId = invocationId
   liveness.activeDispatchId = dispatch.id
@@ -965,9 +1084,15 @@ export async function handleDispatch(state, dispatch, liveness, options = {}) {
       fencingToken: claim.fencingToken,
     })
     phase = 'admission'
+    if (lane === 'chat') {
+      phase = 'attachment-delivery'
+      inboundAttachments = await materializeAttachmentsImpl(state, dispatch)
+    }
+    const deliveredText = appendInboundMediaDirectives(text, inboundAttachments?.paths ?? [])
+    phase = 'admission'
     invocation = lane === 'run'
-      ? operationalArgsImpl(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt)
-      : advisoryArgsImpl(state.runtimeAgentId, state.bindingId, text, { noToolsAttested: state.advisoryNoToolsAttested === true })
+      ? operationalArgsImpl(state.runtimeAgentId, state.bindingId, dispatch.id, text, dispatch.payload?.contract, dispatch.expiresAt, { artifactOutputRoot })
+      : advisoryArgsImpl(state.runtimeAgentId, state.bindingId, deliveredText, { noToolsAttested: state.advisoryNoToolsAttested === true, artifactOutputRoot })
     phase = 'execution'
     journal('dispatch_received', { dispatchId: dispatch.id, bindingId: state.bindingId })
     await postEventImpl(state, statusEvent(state, dispatch, 'working'))
@@ -1061,13 +1186,40 @@ export async function handleDispatch(state, dispatch, liveness, options = {}) {
           terminalSummary: summary,
         }, liveness)
       } else {
+        phase = 'artifact-transfer'
+        const artifactReceipts = await uploadDeclaredArtifacts(state, dispatch, result.stdout, {
+          ...options.artifactTransferOptions, outputRoot: artifactOutputRoot, outputRootHandle: artifactOutputRootHandle, root,
+        })
+        let artifactTerminalIntent = null
         // OpenClaw 2026.7.1 emits one JSON envelope at process completion,
         // not NDJSON streaming frames. Emit one bounded structured delta so
         // the protocol remains status -> delta -> final -> ack.
-        await postEventImpl(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
-        await postEventImpl(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
+        if (artifactReceipts.intentId) {
+          const preparedFinal = finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout))
+          const intent = pendingArtifactIntents(root).find((candidate) => candidate.envelopeId === artifactReceipts.intentId)
+          if (!intent) throw Object.assign(new Error('Artifact completion intent disappeared before terminal delivery.'), { code: 'openclaw-artifact-intent-missing' })
+          artifactTerminalIntent = intent.terminalIntent ?? completedArtifactTerminalIntent(state, dispatch)
+          try {
+            writeArtifactIntent(root, { ...intent, preparedFinal, terminalIntent: artifactTerminalIntent })
+            writeTerminalOutbox(root, artifactTerminalIntent)
+            await postEventImpl(state, preparedFinal)
+          } catch (error) {
+            error.artifactReadyDeliveryPending = true
+            throw error
+          }
+        } else {
+          await postEventImpl(state, deltaEvent(state, dispatch, finalText.slice(0, 20000)))
+          await postEventImpl(state, finalEvent(state, dispatch, finalText, false, extractStructuredModel(result.stdout)))
+        }
         // HFA-004 — exact locked recovery transcript literal.
-        await acknowledgeImpl(state, dispatch, { protocolVersion: PROTOCOL, dispatchId: dispatch.id, state: 'completed', terminalCode: null, terminalSummary: 'Connector recovery passed' }, liveness)
+        try {
+          await acknowledgeImpl(state, dispatch,
+            artifactTerminalIntent ?? completedArtifactTerminalIntent(state, dispatch), liveness)
+        } catch (error) {
+          if (artifactReceipts.intentId) error.artifactReadyDeliveryPending = true
+          throw error
+        }
+        if (artifactReceipts.intentId) markArtifactIntentDelivered(root, artifactReceipts.intentId)
       }
     }
   } catch (error) {
@@ -1077,11 +1229,23 @@ export async function handleDispatch(state, dispatch, liveness, options = {}) {
     const hasTerminalIntent = pendingTerminalOutbox(root)
       .some((acknowledgement) => acknowledgement.dispatchId === dispatch.id)
       || Boolean(state.pendingAcks?.[dispatch.id])
+    const hasArtifactIntent = pendingArtifactIntents(root)
+      .some((intent) => intent.dispatch?.id === dispatch.id)
+    if (phase === 'artifact-transfer' && hasArtifactIntent
+      && (error?.artifactSettlementMayBeReady === true || error?.artifactReadyDeliveryPending === true)) {
+      // Do not author a conflicting Failed terminal while an idempotent
+      // settlement intent may already be Ready on Helm. Supervisor restart
+      // reconciles the durable envelope before ambiguous-claim recovery.
+      throw error
+    }
     if (!readTerminalRecord(root, dispatch.id) && !hasTerminalIntent) {
-      const detail = error instanceof Error ? error.message : String(error)
+      const detail = sanitizeRuntimeError(error instanceof Error ? error.message : String(error))
       const terminalCode = phase === 'admission'
         ? lane === 'run' ? 'helm_link_run_contract_invalid' : 'helm_link_chat_admission_failed'
-        : phase === 'claim-registration' ? 'helm_link_claim_registration_failed' : 'openclaw_invocation_failed'
+        : phase === 'claim-registration' ? 'helm_link_claim_registration_failed'
+          : phase === 'attachment-delivery' ? 'helm_link_attachment_delivery_failed'
+          : phase === 'artifact-transfer' ? 'openclaw_artifact_transfer_failed'
+          : 'openclaw_invocation_failed'
       const summary = `Claimed ${lane} dispatch failed during ${phase}: ${detail}`.slice(0, 500)
       journal('post_claim_terminal_selected', {
         dispatchId: dispatch.id,
@@ -1111,13 +1275,184 @@ export async function handleDispatch(state, dispatch, liveness, options = {}) {
   } finally {
     try {
       if (invocation) await runBoundedCleanup(invocation.cleanup)
+      if (inboundAttachments) await runBoundedCleanup(inboundAttachments.cleanup)
     } finally {
+      try { closeArtifactOutputRootHandle(artifactOutputRootHandle) } catch {}
       liveness.activeDispatchId = null
       liveness.activeGatewayRunId = null
       liveness.cancellation = null
       liveness.activeDispatchStartedAt = null
       delete state.activeInvocationId
+      try { rmSync(artifactOutputRoot, { recursive: true, force: true }) } catch {}
     }
+  }
+}
+
+/**
+ * Transfer only structured OpenClaw artifact declarations. Local paths never
+ * cross the connector boundary: Helm receives a signed metadata envelope,
+ * grants private one-time upload URLs, then verifies checksums before the
+ * dispatch is allowed to complete.
+ */
+export async function uploadDeclaredArtifacts(state, dispatch, stdout, options = {}) {
+  const declarations = extractStructuredArtifactDeclarations(stdout)
+  if (declarations.length === 0) return []
+  const outputs = prepareArtifactOutputs(declarations, {
+    outputRoot: options.outputRoot,
+    outputRootHandle: options.outputRootHandle,
+  })
+  const envelope = buildSignedArtifactEnvelope({ state, dispatch, outputs, model: extractStructuredModel(stdout) })
+  const postImpl = options.postImpl ?? postJson
+  const fetchImpl = options.fetchImpl ?? fetch
+  const root = options.root ?? STATE_DIR
+  const intent = writeArtifactIntent(root, {
+    envelopeId: envelope.envelopeId,
+    dispatch: { id: dispatch.id, messageId: dispatch.messageId ?? null },
+    envelope,
+    outputs: outputs.map(({ bytes, ...output }) => ({ ...output, bytesBase64: bytes.toString('base64') })),
+    finalText: extractStructuredText(stdout),
+    model: extractStructuredModel(stdout),
+    terminalIntent: completedArtifactTerminalIntent(state, dispatch),
+    createdAt: new Date().toISOString(),
+    settlement: null,
+    preparedFinal: null,
+  })
+  const completed = await settleArtifactIntent(state, intent, { root, postImpl, fetchImpl })
+  Object.defineProperty(completed, 'intentId', { value: envelope.envelopeId, enumerable: false })
+  return completed
+}
+
+export async function settleArtifactIntent(state, intent, options = {}) {
+  const postImpl = options.postImpl ?? postJson
+  const fetchImpl = options.fetchImpl ?? fetch
+  const root = options.root ?? STATE_DIR
+  const outputs = intent.outputs.map((output) => {
+    const { bytesBase64, ...metadata } = output
+    return { ...metadata, bytes: Buffer.from(bytesBase64, 'base64') }
+  })
+  const envelope = intent.envelope
+  const declared = await postImpl(state, '/api/helm-link/connector/artifacts', {
+    action: 'declare',
+    envelope,
+  })
+  const grants = Array.isArray(declared?.grants) ? declared.grants : []
+  if (grants.length !== outputs.length) {
+    const error = new Error('Helm returned an incomplete artifact upload grant set.')
+    error.code = 'openclaw-artifact-grant-incomplete'
+    throw error
+  }
+  const completions = []
+  for (const output of outputs) {
+    const grant = grants.find((candidate) => candidate?.transferId === output.transferId)
+    if (!grant || typeof grant.artifactId !== 'string') {
+      const error = new Error('Helm returned an invalid artifact upload grant.')
+      error.code = 'openclaw-artifact-grant-invalid'
+      throw error
+    }
+    if (grant.duplicate === true && grant.state === 'ready') continue
+    if (typeof grant.uploadUrl !== 'string' || !grant.uploadUrl.startsWith('https://')) {
+      const error = new Error('Helm did not provide a private artifact upload destination.')
+      error.code = 'openclaw-artifact-upload-unavailable'
+      throw error
+    }
+    let response
+    try {
+      response = await fetchImpl(grant.uploadUrl, {
+        method: 'PUT',
+        headers: { 'content-type': output.mimeType, 'x-upsert': 'false' },
+        body: output.bytes,
+      })
+    } catch {
+      const error = new Error('OpenClaw artifact upload could not reach Helm storage.')
+      error.code = 'openclaw-artifact-upload-failed'
+      throw error
+    }
+    if (!response?.ok && Number(response?.status) !== 409) {
+      const error = new Error(`OpenClaw artifact upload was rejected (HTTP ${Number(response?.status || 0)}).`)
+      error.code = 'openclaw-artifact-upload-rejected'
+      throw error
+    }
+    completions.push({
+      transferId: output.transferId,
+      artifactId: grant.artifactId,
+      byteSize: output.byteSize,
+      sha256: output.sha256,
+    })
+  }
+  if (completions.length === 0) {
+    const duplicate = grants.map((grant) => ({ artifactId: grant.artifactId, state: 'ready', duplicate: true }))
+    writeArtifactIntent(root, { ...intent, settlement: { state: 'ready', completed: duplicate, settledAt: new Date().toISOString() } })
+    return duplicate
+  }
+  const completionBody = {
+    action: 'complete',
+    envelopeId: envelope.envelopeId,
+    completions,
+  }
+  const completionFailureIsAmbiguous = (error) => error?.code === 'helm_link_request_timeout'
+    || !Number.isInteger(error?.status)
+    || Number(error.status) >= 500
+  let completed
+  try {
+    completed = await postImpl(state, '/api/helm-link/connector/artifacts', completionBody)
+  } catch (firstError) {
+    if (!completionFailureIsAmbiguous(firstError)) throw firstError
+    // Completion is version-fenced and all-or-quarantine on the server. One
+    // identical retry reconciles a lost response without re-uploading bytes,
+    // invoking the provider again, or creating a second artifact.
+    try {
+      completed = await postImpl(state, '/api/helm-link/connector/artifacts', completionBody)
+    } catch (retryError) {
+      if (completionFailureIsAmbiguous(retryError)) retryError.artifactSettlementMayBeReady = true
+      throw retryError
+    }
+  }
+  if (!Array.isArray(completed?.completed) || completed.completed.length !== completions.length
+    || completed.completed.some((artifact) => artifact?.state !== 'ready')) {
+    const error = new Error('Helm did not return verified ready receipts for every uploaded artifact.')
+    error.code = 'openclaw-artifact-receipt-incomplete'
+    throw error
+  }
+  writeArtifactIntent(root, { ...intent, completionBody, settlement: { state: 'ready', completed: completed.completed, settledAt: new Date().toISOString() } })
+  return completed.completed
+}
+
+export async function flushArtifactSettlementOutbox(state, liveness, options = {}) {
+  const root = options.root ?? STATE_DIR
+  const postImpl = options.postImpl ?? postJson
+  const postEventImpl = options.postEventImpl ?? postConnectorEvent
+  const acknowledgeImpl = options.acknowledgeImpl ?? acknowledgeTerminal
+  for (let intent of pendingArtifactIntents(root)) {
+    const terminalRecord = readTerminalRecord(root, intent.dispatch.id)
+    const pendingTerminal = pendingTerminalOutbox(root).find((ack) => ack.dispatchId === intent.dispatch.id)
+    if (terminalRecord?.state === 'failed' || pendingTerminal?.state === 'failed') {
+      markArtifactIntentDelivered(root, intent.envelopeId)
+      continue
+    }
+    await settleArtifactIntent(state, intent, { root, postImpl, fetchImpl: options.fetchImpl ?? fetch })
+    intent = pendingArtifactIntents(root).find((candidate) => candidate.envelopeId === intent.envelopeId) ?? intent
+    const dispatch = { id: intent.dispatch.id, messageId: intent.dispatch.messageId }
+    const preparedFinal = intent.preparedFinal ?? finalEvent(state, dispatch, intent.finalText, false, intent.model)
+    const terminalIntent = intent.terminalIntent ?? completedArtifactTerminalIntent(state, dispatch)
+    if (!intent.preparedFinal || !intent.terminalIntent) writeArtifactIntent(root, { ...intent, preparedFinal, terminalIntent })
+    writeTerminalOutbox(root, terminalIntent)
+    await postEventImpl(state, preparedFinal)
+    await acknowledgeImpl(state, dispatch, terminalIntent, liveness)
+    markArtifactIntentDelivered(root, intent.envelopeId)
+    liveness.lastDispatchProgressAt = Date.now()
+  }
+}
+
+function completedArtifactTerminalIntent(state, dispatch) {
+  return {
+    protocolVersion: PROTOCOL,
+    dispatchId: dispatch.id,
+    invocationId: state.activeInvocationId || null,
+    invocationFencingToken: Number(state.fencingToken || 0),
+    deliveryFencingToken: Number(state.fencingToken || 0),
+    state: 'completed',
+    terminalCode: null,
+    terminalSummary: 'Connector recovery passed',
   }
 }
 
@@ -1560,7 +1895,13 @@ export async function runConnectorLoops(state, options = {}) {
       executing = true
       liveness.queueDepth = Math.max(0, liveness.queueDepth - 1)
       try { await handleImpl(state, dispatch, liveness) }
-      catch (error) { console.error(`[helm-link] execution failed: ${error.message}`) }
+      catch (error) {
+        // An ambiguous artifact settlement must restart the supervised
+        // process so startup convergence re-declares the durable envelope
+        // before the connector can acquire more work or invent Failed.
+        if (error?.artifactSettlementMayBeReady === true || error?.artifactReadyDeliveryPending === true) throw error
+        console.error(`[helm-link] execution failed: ${error.message}`)
+      }
       finally { executing = false }
     }
   }

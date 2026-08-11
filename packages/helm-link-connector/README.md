@@ -7,14 +7,9 @@ OpenClaw agent to Helm Link.
 
 Helm generates a private connection command pinned to an exact public package
 version. Never replace that version with `latest`, reuse an expired connection
-code, or paste or screenshot the command. Version `0.2.7` is the current
-release candidate and is eligible for publication only through the
-repository's tag-bound GitHub OIDC workflow with npm provenance after an
-explicit release authorization gate.
-
-The `0.2.7` archive is prepared but the tag-bound publish workflow remains
-inert; the archive must not be installed on a live binding before that
-separate staging release gate.
+code, or paste or screenshot the command. Version `0.2.8` is the pinned
+public/installable release and is published only through the repository's
+tag-bound GitHub OIDC workflow with npm provenance.
 
 The deterministic CI artifact has an exact SHA-256 in `SHA256SUMS`, but it is
 not the customer installation channel. Current Ubuntu VM and Node 22 container
@@ -23,7 +18,7 @@ hosted round trip. Follow `docs/HELM_LINK_SUPERVISED_PILOT_RUNBOOK.md` for the
 actual-custody gate.
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.2.7' doctor --agent your-openclaw-agent-id
+npx --yes '@pharos-hq/helm-link-connector@0.2.8' doctor --agent your-openclaw-agent-id
 ```
 
 Connection codes are intentionally omitted from documentation. Generate the
@@ -35,6 +30,17 @@ OpenClaw is resolved from `HELM_LINK_OPENCLAW_BIN`, then `OPENCLAW_BIN`, then
 `--deliver`, and never sends to Telegram, WhatsApp, Discord, or another channel.
 Advisory text is passed through a mode-`0600` temporary `--message-file`, not
 through process arguments.
+
+### Inbound Helm attachments
+
+Attachment envelopes contain identifiers, MIME/size metadata, and a SHA-256
+digest—not public URLs or untrusted host paths. The connector downloads each
+file through an Ed25519-signed, nonce-protected Helm request, verifies its size
+and digest, writes it to a private temporary directory, acknowledges a durable
+delivery receipt, and only then exposes the local path through OpenClaw's
+supported `MEDIA:` input directive. Temporary bytes are removed after the turn.
+A missing or mismatched file fails the claimed dispatch before agent invocation;
+it is never degraded into a filename claim.
 
 ## Installed macOS lifecycle
 
@@ -49,9 +55,9 @@ For an already paired Mac, install supervision without replacing the binding,
 key, transcript, or local state:
 
 ```bash
-npx --yes '@pharos-hq/helm-link-connector@0.2.7' install-service
-npx --yes '@pharos-hq/helm-link-connector@0.2.7' service-status
-npx --yes '@pharos-hq/helm-link-connector@0.2.7' uninstall-service
+npx --yes '@pharos-hq/helm-link-connector@0.2.8' install-service
+npx --yes '@pharos-hq/helm-link-connector@0.2.8' service-status
+npx --yes '@pharos-hq/helm-link-connector@0.2.8' uninstall-service
 ```
 
 ## Supervisor templates
