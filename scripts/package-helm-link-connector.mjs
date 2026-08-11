@@ -4,10 +4,15 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
+// Build the immutable 0.2.8 release archive. The package must contain every
+// file, including all lib/*.mjs modules the CLI imports. A partial mirror is
+// not acceptable.
 const EXPECTED_FILES = [
   'package/LICENSE',
   'package/README.md',
   'package/bin/helm-link.mjs',
+  'package/lib/artifact-contract.mjs',
+  'package/lib/artifact-outbox.mjs',
   'package/lib/invocation-claims.mjs',
   'package/lib/lifecycle-journal.mjs',
   'package/lib/terminal-store.mjs',
@@ -56,6 +61,8 @@ const canonicalEntries = [
   { archivePath: 'package/LICENSE', sourcePath: 'packages/helm-link-connector/LICENSE', mode: 0o644 },
   { archivePath: 'package/README.md', sourcePath: 'packages/helm-link-connector/README.md', mode: 0o644 },
   { archivePath: 'package/bin/helm-link.mjs', sourcePath: 'packages/helm-link-connector/bin/helm-link.mjs', mode: 0o755 },
+  { archivePath: 'package/lib/artifact-contract.mjs', sourcePath: 'packages/helm-link-connector/lib/artifact-contract.mjs', mode: 0o644 },
+  { archivePath: 'package/lib/artifact-outbox.mjs', sourcePath: 'packages/helm-link-connector/lib/artifact-outbox.mjs', mode: 0o644 },
   { archivePath: 'package/lib/invocation-claims.mjs', sourcePath: 'packages/helm-link-connector/lib/invocation-claims.mjs', mode: 0o644 },
   { archivePath: 'package/lib/lifecycle-journal.mjs', sourcePath: 'packages/helm-link-connector/lib/lifecycle-journal.mjs', mode: 0o644 },
   { archivePath: 'package/lib/terminal-store.mjs', sourcePath: 'packages/helm-link-connector/lib/terminal-store.mjs', mode: 0o644 },

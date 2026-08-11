@@ -22,13 +22,15 @@ const temporaryDirectories = []
 
 try {
   assert.equal(manifest.package, '@pharos-hq/helm-link-connector')
-  assert.equal(manifest.version, '0.2.7')
-  assert.equal(Object.keys(manifest.files).length, 12)
+  assert.equal(manifest.version, '0.2.8')
+  assert.equal(Object.keys(manifest.files).length, 14)
 
   const expectedFiles = [
     'package/LICENSE',
     'package/README.md',
     'package/bin/helm-link.mjs',
+    'package/lib/artifact-contract.mjs',
+    'package/lib/artifact-outbox.mjs',
     'package/lib/invocation-claims.mjs',
     'package/lib/lifecycle-journal.mjs',
     'package/lib/terminal-store.mjs',
@@ -67,9 +69,9 @@ try {
     workflow,
     /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|npm login|npm adduser/,
   )
-  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.7\.tgz/)
+  assert.match(workflow, /pharos-hq-helm-link-connector-0\.2\.8\.tgz/)
   assert.match(workflow, new RegExp(manifest.archive.sha256))
-  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.7'/)
+  assert.match(workflow, /npm install --ignore-scripts --no-audit --no-fund --prefer-online --cache "\$cache_root" --prefix "\$install_root" '@pharos-hq\/helm-link-connector@0\.2\.8'/)
   assert.match(workflow, /helm-link" doctor --agent fixture-agent/)
 
   const installRoot = temporaryDirectory('helm-link-install-')
@@ -165,7 +167,7 @@ exit 0
   const packedModule = await import(join(installRoot, 'node_modules/@pharos-hq/helm-link-connector/bin/helm-link.mjs'))
   const packedInstall = packedModule.installService({ platformName: 'darwin' })
   assert.equal(packedInstall.installed, true)
-  const packedRuntimeDependency = join(packedStateDir, 'runtime', '0.2.7', 'lib', 'lifecycle-journal.mjs')
+  const packedRuntimeDependency = join(packedStateDir, 'runtime', '0.2.8', 'lib', 'lifecycle-journal.mjs')
   assert.equal(existsSync(packedRuntimeDependency), true)
   process.env.HELM_LINK_FAKE_LAUNCHD_DISABLED = '1'
   process.env.HELM_LINK_FAKE_LAUNCHD_NOT_FOUND = '1'
@@ -191,10 +193,10 @@ exit 0
   assert.equal(missingRuntimeJson.runtimeComplete, false)
   assert.match(missingRuntimeJson.actionableFailureReason, /runtime is incomplete/i)
 
-  console.log('VERIFIED source manifest declares 12 audited package files')
-  console.log('VERIFIED release candidate 0.2.7 is wired only to tag-bound publication')
+  console.log('VERIFIED source manifest declares 14 audited package files')
+  console.log('VERIFIED release candidate 0.2.8 is wired only to tag-bound publication')
   console.log(`VERIFIED reproducible release SHA-256: ${first.hash}`)
-  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.7')
+  console.log('VERIFIED tokenless tag-bound OIDC workflow at 0.2.8')
   console.log('VERIFIED exact cold-cache registry install gate')
   console.log('VERIFIED installed CLI doctor contract')
   console.log('VERIFIED packed artifact lifecycle detects stopped service and missing runtime dependency')
